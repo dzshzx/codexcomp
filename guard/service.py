@@ -21,12 +21,26 @@ LABEL = "codex-516-guard"
 MAC_LABEL = "com.dzshzx.codex-516-guard"
 
 
+def _resolve_exe() -> str:
+    """Absolute path to the installed console-script executable.
+
+    Prefer PATH lookup (stable ~/.local/bin entry). Fall back to sys.argv[0]
+    when the tool dir isn't on PATH — and on Windows re-attach the .exe suffix,
+    which sys.argv[0] drops for console-script launchers.
+    """
+    found = shutil.which(LABEL)
+    if found:
+        return found
+    cand = os.path.abspath(sys.argv[0])
+    if os.name == "nt" and not cand.lower().endswith(".exe") and os.path.exists(cand + ".exe"):
+        cand += ".exe"
+    return cand
+
+
 def _exe_and_args(host: str | None, port: int | None,
                   upstream: str | None, log_level: str | None) -> list[str]:
-    """Resolve the installed console-script path (stable ~/.local/bin symlink
-    preferred over the versioned uv venv path) plus any non-default flags."""
-    exe = shutil.which(LABEL) or os.path.abspath(sys.argv[0])
-    argv = [exe]
+    """Resolved executable path plus any non-default run flags."""
+    argv = [_resolve_exe()]
     if host and host != "127.0.0.1":
         argv += ["--host", host]
     if port and port != 8787:
