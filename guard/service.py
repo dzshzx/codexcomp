@@ -168,25 +168,20 @@ def _startup_vbs_path() -> Path:
     return startup / f"{LABEL}.vbs"
 
 
-def _stop_other_instances() -> None:
-    """Kill running proxy instances by image name, EXCLUDING this process — the
-    console-script launcher shares the codex-516-guard.exe image name, so an
-    unfiltered taskkill would terminate the very command that's running."""
-    _run(["taskkill", "/f", "/im", f"{LABEL}.exe",
-          "/fi", f"PID ne {os.getpid()}"], check=False)
-
-
 def _install_windows(argv: list[str]) -> None:
+    # NB: never `taskkill /im codex-516-guard.exe` — the console-script launcher
+    # (and its uv trampoline parent) share that image name, so it would kill this
+    # very command mid-run. Registering the launcher is idempotent; a duplicate
+    # start just fails to bind the port and exits.
     cmd = subprocess.list2cmdline(argv)              # e.g. "C:\...\codex-516-guard.exe"
     vbs_literal = '"' + cmd.replace('"', '""') + '"'  # VBScript string literal
     vbs = f'CreateObject("WScript.Shell").Run {vbs_literal}, 0, False\n'
     path = _startup_vbs_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(vbs, encoding="utf-8")
-    print(f"installed Startup launcher (no admin, hidden): {path}")
+    _run(["wscript", str(path)], check=False)        # start now, hidden
+    print(f"installed + started Startup launcher (no admin, hidden): {path}")
     print("  runs at next logon; disable with: codex-516-guard uninstall-service")
-    _stop_other_instances()                          # replace any prior instance...
-    _run(["wscript", str(path)], check=False)        # ...and start now, hidden
 
 
 def _uninstall_windows() -> None:
@@ -194,7 +189,7 @@ def _uninstall_windows() -> None:
     existed = path.exists()
     path.unlink(missing_ok=True)
     print(f"removed Startup launcher{'' if existed else ' (was not present)'}: {path}")
-    _stop_other_instances()                          # stop the running proxy (not self)
+    print("  a currently-running instance stays up until you close it or log off")
 
 
 # --- dispatch ----------------------------------------------------------------

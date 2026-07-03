@@ -1,6 +1,6 @@
 [project]
 name = "codex-516-guard"
-version = "0.2.3"
+version = "0.2.4"
 description = "Local Responses proxy for OpenAI Codex CLI: folds gpt-5.5 518n-2 reasoning truncation (516 degradation) via the official openai_base_url wiring — no provider change, WebSocket-first, no fallback noise."
 readme = "README.md"
 license = "MIT"
