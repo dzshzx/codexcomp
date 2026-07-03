@@ -1,11 +1,41 @@
 [project]
 name = "codex-516-guard"
 version = "0.1.0"
-description = "Local Responses proxy for Codex: detects 518n-2 reasoning truncation and folds auto-continuation rounds into one response. Mechanism credit: neteroster/CodexCont (MIT); implementation original."
+description = "Local Responses proxy for OpenAI Codex CLI: folds gpt-5.5 518n-2 reasoning truncation (516 degradation) via the official openai_base_url wiring — no provider change, WebSocket-first, no fallback noise."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "dzshzx" }]
 requires-python = ">=3.12"
+keywords = ["codex", "openai", "proxy", "reasoning", "516", "gpt-5.5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: Proxy Servers",
+]
 dependencies = [
     "starlette>=0.41",
     "uvicorn[standard]>=0.32",
     "httpx>=0.27",
     "zstandard>=0.23",
 ]
+
+[project.urls]
+Homepage = "https://github.com/dzshzx/codex-516-guard"
+Repository = "https://github.com/dzshzx/codex-516-guard"
+Issues = "https://github.com/dzshzx/codex-516-guard/issues"
+
+[project.scripts]
+codex-516-guard = "guard.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["guard"]

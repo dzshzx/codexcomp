@@ -1,14 +1,13 @@
-# systemd user unit example. Install:
+# systemd user unit example (Linux/WSL). Install:
 #   cp systemd/codex-516-guard.service.example ~/.config/systemd/user/codex-516-guard.service
-#   (adjust the paths to your clone location)
 #   systemctl --user daemon-reload && systemctl --user enable --now codex-516-guard
+# Assumes the CLI was installed with: uv tool install codex-516-guard
 [Unit]
 Description=codex-516-guard: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
 After=network-online.target
 
 [Service]
-WorkingDirectory=%h/.local/share/codex-516-guard
-ExecStart=%h/.local/share/codex-516-guard/.venv/bin/python run.py
+ExecStart=%h/.local/bin/codex-516-guard
 Restart=on-failure
 RestartSec=2
 # If your systemd user manager exports a SOCKS proxy (ALL_PROXY), httpx would

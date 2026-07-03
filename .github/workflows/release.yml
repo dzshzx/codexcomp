@@ -1,0 +1,40 @@
+name: release
+
+# Build and publish to PyPI on a version tag, using PyPI Trusted Publishing
+# (OIDC) — no API token stored anywhere. Configure the trusted publisher once
+# at https://pypi.org/manage/project/codex-516-guard/settings/publishing/
+# (or as a pending publisher before the first release):
+#   owner: dzshzx  repo: codex-516-guard  workflow: release.yml  environment: pypi
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.0
