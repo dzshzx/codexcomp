@@ -38,7 +38,7 @@ wheels = [
 
 [[package]]
 name = "codex-516-guard"
-version = "0.2.7"
+version = "0.2.8"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

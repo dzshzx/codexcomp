@@ -4,163 +4,179 @@
 [![Python](https://img.shields.io/pypi/pyversions/codex-516-guard.svg)](https://pypi.org/project/codex-516-guard/)
 [![License: MIT](https://img.shields.io/pypi/l/codex-516-guard.svg)](https://github.com/dzshzx/codex-516-guard/blob/main/LICENSE)
 
-安装：`uv tool install codex-516-guard` · PyPI：<https://pypi.org/project/codex-516-guard/>
+**English** · [简体中文](README.zh-CN.md)
 
-> Local Responses proxy for OpenAI Codex CLI: detects the gpt-5.5 "516" reasoning-truncation
-> fingerprint (`reasoning_tokens == 518*n - 2`), auto-continues the model's thinking, and folds
-> all rounds into one response — **without changing `model_provider`**, so session grouping,
-> remote compaction and remote-control stay intact. WebSocket-first: no
-> "Falling back from WebSockets" retry noise.
-
-自研本地 Responses 代理，缓解 Codex gpt-5.5 的「516 降智」：思考在
-`reasoning_tokens == 518*n - 2`（516、1034、1552…）处被截断，答案质量骤降
-（上游 issue：[openai/codex#30364](https://github.com/openai/codex/issues/30364)，无官方修复）。
-本代理检测该指纹后自动让模型继续思考，并把多轮续写**折叠为单个下游响应**。
-
-机制思路来自 [neteroster/CodexCont](https://github.com/neteroster/CodexCont)（MIT），
-实现为全新代码。与其关键差异：
-
-| | codex-516-guard | CodexCont |
-| --- | --- | --- |
-| Codex 侧接线 | 顶层 `openai_base_url`（**不新建 provider**） | 新建 `[model_providers]`（会话按 provider 分组被隐藏、remote-control 不可用、丢远程压缩） |
-| 下游传输 | **WebSocket 第一传输**（完整实现 `responses_websockets` 协议）+ SSE 兜底 | 仅 SSE（codex 先试 ws → 405 → 每会话约 5 次重连告警后回退） |
-| zstd 请求压缩（0.142.x 内置 provider 默认开） | 原生解压，无需改 codex 配置 | 需 `[features] enable_request_compression = false` |
-| `GET /v1/models` 模型目录刷新 | `/v1/*` 透传 | 未代理（静默失败，靠本地缓存） |
-| 续写方法 | commentary 法（`phase:"commentary"` 消息 + encrypted reasoning 重放） | commentary + tool_pair legacy + 跨轮 repair 等更多可配置项 |
-
-## 原理
-
-1. 上游每轮结束时读取 `usage.output_tokens_details.reasoning_tokens`，命中 `518n-2`（n∈[1,6]，最多续写 3 轮）即判定思考被截断；
-2. 丢弃该轮的**暂定输出**（message / tool calls——它们基于被截断的思考），把该轮 reasoning items（含 `encrypted_content`）+ 一条 `Continue thinking...` 的 `phase:"commentary"` 助手消息追加进 input 重放，开下一轮；
-3. 思考流实时透传给 agent，只有干净收尾那一轮的最终输出被放行；terminal 事件重建为单响应口径的 usage（input 取第 1 轮防止「假爆上下文」，reasoning 求和），真实累计成本记在 `metadata.proxy_billed_usage`。
-
-## 安装
-
-要求：[uv](https://docs.astral.sh/uv/)（自带 Python 管理）、Codex CLI（ChatGPT OAuth 登录，0.142.x 实测）。
+A tiny local Responses proxy for the **OpenAI Codex CLI** that cures the gpt-5.5
+**"516" reasoning-truncation degradation** — while leaving your `model_provider`
+untouched, so session grouping, remote compaction and remote-control keep working.
 
 ```bash
-uv tool install codex-516-guard          # 从 PyPI 安装
-# 或直接从源码仓库：
-# uv tool install git+https://github.com/dzshzx/codex-516-guard
+uv tool install codex-516-guard      # install
+codex-516-guard                      # run (127.0.0.1:8787)
+# then add one line to ~/.codex/config.toml:  openai_base_url = "http://127.0.0.1:8787/v1"
 ```
 
-uv 会建一个隔离环境并把可执行文件放进 uv 的 bin 目录（Unix/macOS 默认 `~/.local/bin`，
-Windows 用 `where.exe codex-516-guard` 查实际路径；`uv tool update-shell` 可把该目录加进 PATH）。
-之后：
+> **Credits.** The detection-and-continue idea comes from
+> [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont) (MIT) — thank you.
+> This project is an independent, from-scratch implementation that keeps the built-in
+> provider intact; see [Differences](#differences-from-codexcont).
 
-```bash
-codex-516-guard                          # 前台跑起（默认 127.0.0.1:8787）
-codex-516-guard --port 8790 --log-level debug   # 可选：--host/--port/--upstream/--log-level/--auto-port
-```
+---
 
-**端口**：代理端口必须和 Codex 的 `openai_base_url` 端口一致。默认端口（8787）被占用时代理**直接报错退出**
-——因为一个被接线的代理必须独占它那个端口，漂到别处只会让「代理在跑、Codex 却连不上」。换端口就用
-`--port N` 并把 Codex 的 `openai_base_url` 一起改成 `N`。`--auto-port` 仅用于交互式随手跑：占用时向后
-找空闲端口并打印实际端口，你得据此再去接线——**不要**用在被接线的后台服务上。
+## The problem: gpt-5.5 "516" degradation
 
-升级 / 卸载：`uv tool upgrade codex-516-guard` / `uv tool uninstall codex-516-guard`。
+On the OpenAI Codex CLI, gpt-5.5's reasoning sometimes gets cut short at a very
+specific token count — `reasoning_tokens == 518 * n − 2` (i.e. **516, 1034, 1552, …**).
+When a turn lands on that fingerprint, the model stops thinking early and the answer
+quality drops sharply. It is an upstream issue with no official fix
+([openai/codex#30364](https://github.com/openai/codex/issues/30364)).
 
-Codex 侧接线——`~/.codex/config.toml` 顶层（必须在第一个 `[table]` 之前）加一行：
+`codex-516-guard` sits on `127.0.0.1` between Codex and the upstream Responses API.
+When it sees a turn truncate on the `518n−2` fingerprint, it **makes the model keep
+thinking** and **folds the extra rounds into a single downstream response**, so Codex
+sees one clean, complete answer.
+
+## How it works
+
+The proxy streams every upstream round and runs a small state machine (`guard/fold.py`):
+
+1. **Detect.** At the end of each round it reads
+   `usage.output_tokens_details.reasoning_tokens`. If it equals `518n − 2` (with
+   `1 ≤ n ≤ 6`, and at most 3 continuation rounds), the round was truncated.
+2. **Continue.** It discards that round's *tentative* output (the message / tool calls —
+   they were produced on truncated thinking), then replays the round's reasoning items
+   (including `encrypted_content`) plus a single `phase:"commentary"` assistant message
+   (`"Continue thinking..."`) as the next round's input. That nudges the model to resume
+   reasoning where it left off.
+3. **Fold.** Reasoning is streamed live to Codex the whole time; only the *clean* final
+   round's output is flushed. The terminal event is rebuilt as if the whole thing were
+   one response — `input`/`cached` come from round 1 (so it never looks like a blown
+   context window), reasoning is summed, and the true cumulative cost is recorded under
+   `metadata.proxy_billed_usage`.
+
+### Wiring: why the built-in provider stays intact
+
+Codex is pointed at the proxy with **one top-level config key**, not a new provider:
 
 ```toml
+# ~/.codex/config.toml  (top level, before the first [table])
 openai_base_url = "http://127.0.0.1:8787/v1"
 ```
 
-这是覆盖内置 openai provider base_url 的**官方 config key**
-（[#16719](https://github.com/openai/codex/issues/16719)；同名 `[model_providers.openai]`
-覆盖被维护者拒绝，`OPENAI_BASE_URL` 环境变量已移除）。provider id 保持 `openai`，
-因此会话历史分组、远程压缩、remote-control 均不受影响。
+`openai_base_url` overrides the base URL of the **built-in `openai` provider** in place.
+This is the officially supported key
+([openai/codex#16719](https://github.com/openai/codex/issues/16719); the same-name
+`[model_providers.openai]` override is rejected by the maintainers, and the
+`OPENAI_BASE_URL` env var was removed). Because the provider id stays `openai`:
 
-**关闭**：注释掉 `openai_base_url` 行 + 停掉代理进程。代理停止而 key 在位时，Codex 会因上游不可达报错。
+- your conversation history is **not** re-bucketed/hidden by provider,
+- **remote compaction** keeps working (`supports_remote_compaction` stays true),
+- **remote-control** is unaffected (it uses the separate `chatgpt_base_url`).
 
-## 开机自启动（可选，默认不开）
+### Differences from CodexCont
 
-安装本身**不注册任何自启动**——是否开机自启完全由你决定。要开时一条命令，不想开就别运行它。
+The 518n−2 detection + fold-continuation mechanism is [CodexCont]'s idea; the
+implementation here is new and diverges on a few deliberate points:
 
-```bash
-codex-516-guard install-service     # 注册并立即启动（当前平台）
-codex-516-guard uninstall-service   # 撤销
-```
+|  | codex-516-guard | CodexCont |
+| --- | --- | --- |
+| **Codex wiring** | top-level `openai_base_url` (**built-in provider unchanged**) | a new `[model_providers]` entry (history hidden per-provider, remote-control unusable, remote compaction lost) |
+| **Downstream transport** | **WebSocket-first** — full `responses_websockets` protocol, plus SSE fallback | SSE only (Codex tries ws → 405 → ~5 reconnect warnings per session, then falls back) |
+| **zstd request bodies** (0.142.x built-in provider) | decompressed natively, no Codex config change | needs `[features] enable_request_compression = false` |
+| **`GET /v1/models`** (model-catalog refresh) | passed through (`/v1/*`) | not proxied (silently fails, relies on cache) |
+| **Continuation** | commentary method only | commentary + legacy tool-pair + cross-turn repair, more knobs |
 
-`install-service` 按平台选「随用户登录启动、跑在用户上下文」的方式（而非系统级服务——系统服务跑在无用户环境的
-session 里，够不到用户 profile 下的 uv 可执行文件与代理设置）：**Linux/WSL** → systemd user unit；
-**macOS** → launchd LaunchAgent（`~/Library/LaunchAgents/`）。自定义端口等参数会一并写进自启动条目：
-`codex-516-guard install-service --port 8790`。**Windows 例外**——`install-service` 只打印手动步骤、
-不自动注册（行为杀软会把程序化自启持久化判为木马，详见下方 Windows 小节）。
+[CodexCont]: https://github.com/neteroster/CodexCont
 
-下面是各平台**手动等价操作**（想自己管、或 `install-service` 在你的环境跑不动时用）。先用
-`which codex-516-guard`（Unix/macOS）/ `where.exe codex-516-guard`（Windows）拿到绝对路径。
+## Install
 
-### Linux / WSL — systemd user unit
-
-`install-service` 生成的等价 unit 见 `systemd/codex-516-guard.service.example`：
-
-```bash
-cp systemd/codex-516-guard.service.example ~/.config/systemd/user/codex-516-guard.service
-systemctl --user daemon-reload && systemctl --user enable --now codex-516-guard
-loginctl enable-linger   # 可选：无需登录也在开机时启动
-```
-
-### macOS — launchd LaunchAgent
-
-macOS 用 launchd 管理后台任务。放在 `~/Library/LaunchAgents/` 的是 **LaunchAgent**，随**用户登录**启动、
-跑在用户 GUI session 里（对回环代理正确的选择）；`/Library/LaunchDaemons/` 里的 LaunchDaemon 开机即起但无用户会话，本场景不适用。
-
-把可执行文件绝对路径填进下面的 plist，存为 `~/Library/LaunchAgents/com.dzshzx.codex-516-guard.plist`：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>            <string>com.dzshzx.codex-516-guard</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/YOU/.local/bin/codex-516-guard</string>
-    </array>
-    <key>RunAtLoad</key>        <true/>
-    <key>KeepAlive</key>        <true/>
-    <key>StandardOutPath</key>  <string>/tmp/codex-516-guard.log</string>
-    <key>StandardErrorPath</key><string>/tmp/codex-516-guard.log</string>
-</dict>
-</plist>
-```
-
-注意：launchd 不读 shell 配置，`ProgramArguments` 必须是**绝对路径**；崩溃后 `KeepAlive` 会重启（10 秒节流）。
-加载 / 停用（现代 `launchctl`，`load`/`unload` 已是 legacy）：
+Requires [uv](https://docs.astral.sh/uv/) (which manages Python for you) and the Codex
+CLI (ChatGPT OAuth login; tested on 0.142.x).
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dzshzx.codex-516-guard.plist
-launchctl enable   gui/$(id -u)/com.dzshzx.codex-516-guard
-launchctl kickstart -k gui/$(id -u)/com.dzshzx.codex-516-guard   # 立即（重）启动
-launchctl bootout  gui/$(id -u)/com.dzshzx.codex-516-guard        # 卸载
+uv tool install codex-516-guard          # from PyPI
+# or straight from source:
+# uv tool install git+https://github.com/dzshzx/codex-516-guard
 ```
 
-### Windows — 手动建启动项（工具不自动注册，出于杀软考虑）
+uv puts the executable in its bin dir (`~/.local/bin` on Unix/macOS; on Windows run
+`where.exe codex-516-guard`; `uv tool update-shell` adds it to PATH). Then:
 
-`install-service` 在 Windows **不自动注册自启，只打印手动步骤**。原因：程序自动写入启动项
-（Startup VBS / 注册表 Run 键 / 计划任务）再拉起隐藏进程，正是行为杀软判定木马持久化的特征——
-实测 Kaspersky 的主动防御（PDM）会对执行该动作的 `python.exe` 报 `PDM:Trojan.Win32.Generic`。
-**用户在受信任 UI 里自己建的启动项则被杀软信任。**
+```bash
+codex-516-guard                          # run in foreground (default 127.0.0.1:8787)
+codex-516-guard --port 8790 --log-level debug
+```
 
-本包提供无窗口入口 `codex-516-guardw`（Windows GUI 子系统 exe，登录时无黑框）。手动自启：
+Wire Codex to it (one line in `~/.codex/config.toml`, see above), and you're done.
+**Disable** by commenting out the `openai_base_url` line and stopping the proxy. (If the
+key stays but the proxy is down, Codex errors on an unreachable upstream.)
 
-1. `Win+R` 运行 `shell:startup` 打开启动文件夹；
-2. 新建快捷方式，目标填 `where.exe codex-516-guardw` 得到的路径（需要自定义端口就在后面加 `--port 8790`）。
+Upgrade / uninstall: `uv tool upgrade codex-516-guard` / `uv tool uninstall codex-516-guard`.
 
-删除该快捷方式即取消自启。（`install-service` 在 Windows 会打印上述步骤和你的 exe 绝对路径。）
+### Ports
 
-为什么不用系统 service：原生 service 要求实现 SCM 协议（`sc.exe` 直指控制台程序会 1053 超时），
-且跑在 session 0/SYSTEM，够不到用户 profile 下 uv 装的 exe 与代理设置。
+The proxy's port **must match** the port in Codex's `openai_base_url`. If the default
+port (8787) is busy, the proxy **exits with a clear message** rather than drifting — a
+wired proxy that silently binds another port would just be unreachable. To use a
+different port, pass `--port N` and set `openai_base_url` to the same `N`.
 
-## 验证
+`--auto-port` is for interactive one-off runs only: on a conflict it scans for the next
+free port and prints which `openai_base_url` to use. Don't use it for a wired service.
+
+## Autostart (optional, off by default)
+
+Installing registers **no** autostart — it's entirely your choice.
+
+```bash
+codex-516-guard install-service     # register + start (current platform)
+codex-516-guard uninstall-service   # remove
+```
+
+`install-service` picks the per-user, runs-in-your-session mechanism (a system service
+runs in a session with no user environment and can't reach the uv executable or your
+proxy settings under your profile):
+
+- **Linux / WSL** → a systemd **user** unit (`~/.config/systemd/user/`). Run
+  `loginctl enable-linger` once to start it at boot without logging in. Manual equivalent:
+  see `systemd/codex-516-guard.service.example`.
+- **macOS** → a launchd **LaunchAgent** in `~/Library/LaunchAgents/` (starts at login, in
+  your GUI session). Load with `launchctl bootstrap gui/$(id -u) <plist>` /
+  `launchctl kickstart -k …`; remove with `launchctl bootout …`.
+- **Windows** → **prints manual steps, registers nothing** (see below).
+
+### Windows autostart is manual — on purpose
+
+A program that writes an autostart entry (Startup VBS / Run key / scheduled task) and
+launches a hidden process trips behavioral antivirus as trojan-like persistence —
+Kaspersky's proactive-defense module flags the launching `python.exe` as
+`PDM:Trojan.Win32.Generic`. A **user-created** Startup shortcut is trusted by the same AV.
+
+So this package ships a windowless launcher, `codex-516-guardw` (a Windows GUI-subsystem
+exe — no console window at logon), and `install-service` just tells you how to point a
+shortcut at it:
+
+1. `Win+R` → `shell:startup` (opens the Startup folder).
+2. New → Shortcut → target = the path from `where.exe codex-516-guardw` (append
+   `--port N` if you use a custom port).
+
+Delete the shortcut to disable it.
+
+### Mirrored-networking shortcut (WSL ↔ Windows)
+
+If your WSL2 uses `networkingMode=mirrored`, Windows and WSL **share `127.0.0.1`**. Then
+you only need **one** proxy on either side — run it in WSL (as a systemd service), and on
+the Windows side just add the `openai_base_url` line to `~/.codex/config.toml` pointing at
+the same `127.0.0.1:8787`. No second proxy or Windows autostart needed (the only cost is
+that Windows Codex depends on the WSL proxy being up).
+
+## Verify
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz            # {"ok":true,...}
-journalctl --user -u codex-516-guard -f | grep -E 'round|done'   # Linux/WSL；mac 看 plist 日志文件
+journalctl --user -u codex-516-guard -f | grep -E 'round|done'   # Linux/WSL
 ```
 
-命中折叠时的日志（实测样例，连环双 516 被击破、答案正确）：
+A live fold looks like this (two chained 516s beaten, answer correct):
 
 ```
 round 1: in=21550 out=664 reason=516 total=22214 | n=1 buffered=['function_call'] -> continue
@@ -169,30 +185,49 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
-## 开发
+## Develop
 
 ```bash
 git clone https://github.com/dzshzx/codex-516-guard && cd codex-516-guard
 uv sync
-uv run python test_fold.py        # 折叠状态机自测，应输出 ALL PASS
-uv run codex-516-guard            # 本地跑
+uv run python test_fold.py        # fold state-machine self-test → ALL PASS
+uv run codex-516-guard            # run locally
 ```
 
-发布走 PyPI Trusted Publishing（`.github/workflows/release.yml`，OIDC，无 token）：推 `v*` tag 即自动构建上传。
+Releases go out via PyPI Trusted Publishing (`.github/workflows/release.yml`, OIDC, no
+stored token): push a `v*` tag and it builds + publishes automatically.
 
-## 结构
+Layout:
 
-- `guard/fold.py` — 指纹检测 + 折叠状态机（传输无关；`test_fold.py` 覆盖丢弃/放行、重编号、双口径 usage）
-- `guard/server.py` — starlette 传输层：ws / SSE 下游、SSE 上游、zstd/gzip 请求解压、`/v1/*` 透传
-- `guard/cli.py` — CLI 入口（`codex-516-guard`；仅监听回环；auth passthrough，不存储任何凭据）
+- `guard/fold.py` — fingerprint detection + fold state machine (transport-agnostic;
+  covered by `test_fold.py`).
+- `guard/server.py` — starlette transport: ws / SSE downstream, SSE upstream,
+  zstd/gzip request decompression, `/v1/*` passthrough.
+- `guard/cli.py` — CLI entry (`codex-516-guard`; loopback only; auth passthrough, stores
+  no credentials).
 
-## 安全与免责
+## Security & disclaimer
 
-- 代理只做 auth **passthrough**：转发 Codex 发来的 Authorization 头，不读取、不落盘任何凭据。
-- 仅监听回环地址；不要暴露到非回环接口。
-- 非官方项目，依赖上游未公开的行为（截断指纹、ws 帧格式），OpenAI 侧变更可能使其失效；使用风险自负。
-- 续写会产生额外的真实 token 消耗（见 `metadata.proxy_billed_usage`），guard 以 n 窗口 + 3 轮上限约束。
+- The proxy is **auth passthrough** only: it forwards Codex's `Authorization` header and
+  never reads, stores, or logs any credential.
+- It listens on the **loopback** address only — do not expose it on a non-loopback interface.
+- **Unofficial**: it depends on upstream behavior that isn't a public contract (the
+  truncation fingerprint, the ws frame format). An OpenAI-side change may break it. Use at
+  your own risk.
+- Continuation spends **extra real tokens** (see `metadata.proxy_billed_usage`); the guard
+  bounds this with an `n` window and a 3-round cap.
+
+## Community
+
+Built for and shared with the [**LINUX DO**](https://linux.do) community, where the
+gpt-5.5 "516" degradation was diagnosed and discussed. Feedback and issues welcome there
+and on [GitHub Issues](https://github.com/dzshzx/codex-516-guard/issues).
 
 ## License
 
-MIT（见 LICENSE；机制思路 credit neteroster/CodexCont）。
+[MIT](LICENSE). Fully open source, no closed parts.
+
+Mechanism credit: [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont) (MIT) —
+this project reuses its 518n−2 detect-and-continue *idea* with an independent, from-scratch
+implementation, and keeps the built-in provider intact (see [Differences](#differences-from-codexcont)).
+CodexCont's MIT copyright notice is retained in [LICENSE](LICENSE).
