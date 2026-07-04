@@ -1,4 +1,4 @@
-"""codex-516-guard transport layer.
+"""codexcomp transport layer.
 
 Downstream (Codex, wired via top-level `openai_base_url`):
   * WebSocket /v1/responses  — Codex's preferred transport (openai-beta
@@ -32,10 +32,10 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .fold import DONE, RoundOpenError, fold
 
-log = logging.getLogger("guard.server")
+log = logging.getLogger("codexcomp.server")
 
 UPSTREAM_BASE = os.environ.get(
-    "GUARD_UPSTREAM_BASE", "https://chatgpt.com/backend-api/codex"
+    "CODEXCOMP_UPSTREAM_BASE", "https://chatgpt.com/backend-api/codex"
 ).rstrip("/")
 RESPONSES_URL = UPSTREAM_BASE + "/responses"
 

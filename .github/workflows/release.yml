@@ -2,9 +2,9 @@ name: release
 
 # Build and publish to PyPI on a version tag, using PyPI Trusted Publishing
 # (OIDC) — no API token stored anywhere. Configure the trusted publisher once
-# at https://pypi.org/manage/project/codex-516-guard/settings/publishing/
+# at https://pypi.org/manage/project/codexcomp/settings/publishing/
 # (or as a pending publisher before the first release):
-#   owner: dzshzx  repo: codex-516-guard  workflow: release.yml  environment: pypi
+#   owner: dzshzx  repo: codexcomp  workflow: release.yml  environment: pypi
 
 on:
   push:

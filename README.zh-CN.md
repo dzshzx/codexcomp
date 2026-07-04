@@ -1,8 +1,8 @@
-# codex-516-guard
+# codexcomp
 
-[![PyPI](https://img.shields.io/pypi/v/codex-516-guard.svg)](https://pypi.org/project/codex-516-guard/)
-[![Python](https://img.shields.io/pypi/pyversions/codex-516-guard.svg)](https://pypi.org/project/codex-516-guard/)
-[![License: MIT](https://img.shields.io/pypi/l/codex-516-guard.svg)](https://github.com/dzshzx/codex-516-guard/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![Python](https://img.shields.io/pypi/pyversions/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![License: MIT](https://img.shields.io/pypi/l/codexcomp.svg)](https://github.com/dzshzx/codexcomp/blob/main/LICENSE)
 
 [English](README.md) · **简体中文**
 
@@ -11,8 +11,8 @@
 remote-control 全部照常。
 
 ```bash
-uv tool install codex-516-guard      # 安装
-codex-516-guard                      # 运行（127.0.0.1:8787）
+uv tool install codexcomp      # 安装
+codexcomp                      # 运行（127.0.0.1:8787）
 # 然后在 ~/.codex/config.toml 顶层加一行：  openai_base_url = "http://127.0.0.1:8787/v1"
 ```
 
@@ -29,13 +29,13 @@ codex-516-guard                      # 运行（127.0.0.1:8787）
 模型就提前停止思考，答案质量骤降。这是上游问题、无官方修复
 （[openai/codex#30364](https://github.com/openai/codex/issues/30364)）。
 
-`codex-516-guard` 跑在 `127.0.0.1` 上、夹在 Codex 与上游 Responses API 之间。当它发现某轮
+`codexcomp` 跑在 `127.0.0.1` 上、夹在 Codex 与上游 Responses API 之间。当它发现某轮
 命中 `518n−2` 指纹截断时，就**让模型继续思考**，并把多出来的续写轮**折叠成单个下游响应**——
 Codex 收到的是一个干净、完整的答案。
 
 ## 工作原理
 
-代理逐轮流式转发上游，并跑一个小状态机（`guard/fold.py`）：
+代理逐轮流式转发上游，并跑一个小状态机（`codexcomp/fold.py`）：
 
 1. **检测。** 每轮结束时读 `usage.output_tokens_details.reasoning_tokens`。若等于
    `518n − 2`（`1 ≤ n ≤ 6`，最多续写 3 轮），判定该轮被截断。
@@ -68,7 +68,7 @@ provider id 仍是 `openai`：
 
 518n−2 检测 + 折叠续写这套机制是 [CodexCont] 的思路；这里的实现是全新的，并在几处有意分道：
 
-|  | codex-516-guard | CodexCont |
+|  | codexcomp | CodexCont |
 | --- | --- | --- |
 | **Codex 接线** | 顶层 `openai_base_url`（**内置 provider 不变**） | 新建 `[model_providers]`（历史按 provider 隐藏、remote-control 不可用、丢远程压缩） |
 | **下游传输** | **WebSocket 第一传输**——完整实现 `responses_websockets` 协议，另有 SSE 兜底 | 仅 SSE（Codex 先试 ws → 405 → 每会话约 5 次重连告警后回退） |
@@ -84,23 +84,23 @@ provider id 仍是 `openai`：
 0.142.x 实测）。
 
 ```bash
-uv tool install codex-516-guard          # 从 PyPI 安装
+uv tool install codexcomp          # 从 PyPI 安装
 # 或直接从源码：
-# uv tool install git+https://github.com/dzshzx/codex-516-guard
+# uv tool install git+https://github.com/dzshzx/codexcomp
 ```
 
 uv 会把可执行文件放进它的 bin 目录（Unix/macOS 是 `~/.local/bin`；Windows 用
-`where.exe codex-516-guard` 查；`uv tool update-shell` 可把该目录加进 PATH）。然后：
+`where.exe codexcomp` 查；`uv tool update-shell` 可把该目录加进 PATH）。然后：
 
 ```bash
-codex-516-guard                          # 前台运行（默认 127.0.0.1:8787）
-codex-516-guard --port 8790 --log-level debug
+codexcomp                          # 前台运行（默认 127.0.0.1:8787）
+codexcomp --port 8790 --log-level debug
 ```
 
 按上面那一行把 Codex 接到它即可。**关闭**：注释掉 `openai_base_url` 行 + 停掉代理。（key 还在但
 代理停了，Codex 会因上游不可达报错。）
 
-升级 / 卸载：`uv tool upgrade codex-516-guard` / `uv tool uninstall codex-516-guard`。
+升级 / 卸载：`uv tool upgrade codexcomp` / `uv tool uninstall codexcomp`。
 
 ### 端口
 
@@ -116,8 +116,8 @@ codex-516-guard --port 8790 --log-level debug
 安装本身**不注册任何自启**——开不开完全由你决定。
 
 ```bash
-codex-516-guard install-service     # 注册并启动（当前平台）
-codex-516-guard uninstall-service   # 撤销
+codexcomp install-service     # 注册并启动（当前平台）
+codexcomp uninstall-service   # 撤销
 ```
 
 `install-service` 选「随用户登录、跑在用户会话内」的方式（系统级服务跑在无用户环境的 session 里，
@@ -125,7 +125,7 @@ codex-516-guard uninstall-service   # 撤销
 
 - **Linux / WSL** → systemd **user** unit（`~/.config/systemd/user/`）。跑一次
   `loginctl enable-linger` 可让它开机（无需登录）就起。手动等价见
-  `systemd/codex-516-guard.service.example`。
+  `systemd/codexcomp.service.example`。
 - **macOS** → `~/Library/LaunchAgents/` 里的 launchd **LaunchAgent**（随登录、在 GUI session 内）。
   用 `launchctl bootstrap gui/$(id -u) <plist>` / `launchctl kickstart -k …` 加载，
   `launchctl bootout …` 卸载。
@@ -137,11 +137,11 @@ codex-516-guard uninstall-service   # 撤销
 持久化——Kaspersky 主动防御模块会把执行该动作的 `python.exe` 报 `PDM:Trojan.Win32.Generic`。而
 **用户自己建**的启动项则被同一杀软信任。
 
-所以本包提供无窗口入口 `codex-516-guardw`（Windows GUI 子系统 exe，登录时无黑框），
+所以本包提供无窗口入口 `codexcompw`（Windows GUI 子系统 exe，登录时无黑框），
 `install-service` 只告诉你怎么把快捷方式指向它：
 
 1. `Win+R` → `shell:startup`（打开启动文件夹）；
-2. 新建 → 快捷方式 → 目标填 `where.exe codex-516-guardw` 得到的路径（自定义端口就在后面加
+2. 新建 → 快捷方式 → 目标填 `where.exe codexcompw` 得到的路径（自定义端口就在后面加
    `--port N`）。
 
 删掉该快捷方式即取消自启。
@@ -157,7 +157,7 @@ codex-516-guard uninstall-service   # 撤销
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz            # {"ok":true,...}
-journalctl --user -u codex-516-guard -f | grep -E 'round|done'   # Linux/WSL
+journalctl --user -u codexcomp -f | grep -E 'round|done'   # Linux/WSL
 ```
 
 命中折叠时的日志（实测，连环双 516 被击破、答案正确）：
@@ -172,10 +172,10 @@ done: 3 round(s) | ... | status=completed stop=natural
 ## 开发
 
 ```bash
-git clone https://github.com/dzshzx/codex-516-guard && cd codex-516-guard
+git clone https://github.com/dzshzx/codexcomp && cd codexcomp
 uv sync
 uv run python test_fold.py        # 折叠状态机自测 → ALL PASS
-uv run codex-516-guard            # 本地跑
+uv run codexcomp            # 本地跑
 ```
 
 发布走 PyPI Trusted Publishing（`.github/workflows/release.yml`，OIDC，无 token）：推 `v*` tag
@@ -183,21 +183,21 @@ uv run codex-516-guard            # 本地跑
 
 结构：
 
-- `guard/fold.py` — 指纹检测 + 折叠状态机（传输无关；`test_fold.py` 覆盖）。
-- `guard/server.py` — starlette 传输层：ws / SSE 下游、SSE 上游、zstd/gzip 请求解压、`/v1/*` 透传。
-- `guard/cli.py` — CLI 入口（`codex-516-guard`；仅监听回环；auth passthrough，不存任何凭据）。
+- `codexcomp/fold.py` — 指纹检测 + 折叠状态机（传输无关；`test_fold.py` 覆盖）。
+- `codexcomp/server.py` — starlette 传输层：ws / SSE 下游、SSE 上游、zstd/gzip 请求解压、`/v1/*` 透传。
+- `codexcomp/cli.py` — CLI 入口（`codexcomp`；仅监听回环；auth passthrough，不存任何凭据）。
 
 ## 安全与免责
 
 - 代理只做 **auth passthrough**：转发 Codex 的 `Authorization` 头，不读取、不落盘、不打印任何凭据。
 - 仅监听**回环**地址——不要暴露到非回环接口。
 - **非官方**：依赖上游非公开契约的行为（截断指纹、ws 帧格式），OpenAI 侧变更可能使其失效，风险自负。
-- 续写会花**额外的真实 token**（见 `metadata.proxy_billed_usage`）；guard 用 `n` 窗口 + 3 轮上限约束。
+- 续写会花**额外的真实 token**（见 `metadata.proxy_billed_usage`）；codexcomp 用 `n` 窗口 + 3 轮上限约束。
 
 ## 社区
 
 本项目为 [**LINUX DO**](https://linux.do) 社区而作、并在其中分享——gpt-5.5「516 降智」正是在这里
-被定位与讨论。欢迎在社区帖或 [GitHub Issues](https://github.com/dzshzx/codex-516-guard/issues) 反馈。
+被定位与讨论。欢迎在社区帖或 [GitHub Issues](https://github.com/dzshzx/codexcomp/issues) 反馈。
 
 ## 许可
 

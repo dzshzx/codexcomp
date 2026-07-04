@@ -1,9 +1,9 @@
-"""codex-516-guard CLI entry point (installed via [project.scripts]).
+"""codexcomp CLI entry point (installed via [project.scripts]).
 
 Usage:
-  codex-516-guard [--host H] [--port P] [--upstream U] [--log-level L]   run the proxy
-  codex-516-guard install-service   [same flags]   opt-in autostart for this platform
-  codex-516-guard uninstall-service                remove the autostart entry
+  codexcomp [--host H] [--port P] [--upstream U] [--log-level L]   run the proxy
+  codexcomp install-service   [same flags]   opt-in autostart for this platform
+  codexcomp uninstall-service                remove the autostart entry
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def _pick_port(host: str, start: int) -> int:
 def _serve(args) -> int:
     import uvicorn
     if args.upstream:
-        os.environ["GUARD_UPSTREAM_BASE"] = args.upstream
+        os.environ["CODEXCOMP_UPSTREAM_BASE"] = args.upstream
     port = args.port
     if args.auto_port:
         port = _pick_port(args.host, args.port)
@@ -67,14 +67,14 @@ def _serve(args) -> int:
         return 1
     logging.basicConfig(level=args.log_level.upper(),
                         format="%(levelname)s:%(name)s:%(message)s")
-    uvicorn.run("guard.server:app", host=args.host, port=port,
+    uvicorn.run("codexcomp.server:app", host=args.host, port=port,
                 log_level=args.log_level)
     return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="codex-516-guard",
+        prog="codexcomp",
         description=(
             "Local Responses proxy for Codex CLI: detects the gpt-5.5 518n-2 "
             "reasoning-truncation fingerprint, auto-continues thinking, and folds "

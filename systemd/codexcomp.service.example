@@ -1,13 +1,13 @@
 # systemd user unit example (Linux/WSL). Install:
-#   cp systemd/codex-516-guard.service.example ~/.config/systemd/user/codex-516-guard.service
-#   systemctl --user daemon-reload && systemctl --user enable --now codex-516-guard
-# Assumes the CLI was installed with: uv tool install codex-516-guard
+#   cp systemd/codexcomp.service.example ~/.config/systemd/user/codexcomp.service
+#   systemctl --user daemon-reload && systemctl --user enable --now codexcomp
+# Assumes the CLI was installed with: uv tool install codexcomp
 [Unit]
-Description=codex-516-guard: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
+Description=codexcomp: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
 After=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/codex-516-guard
+ExecStart=%h/.local/bin/codexcomp
 Restart=on-failure
 RestartSec=2
 # If your systemd user manager exports a SOCKS proxy (ALL_PROXY), httpx would

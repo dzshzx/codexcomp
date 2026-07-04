@@ -1,6 +1,6 @@
 [project]
-name = "codex-516-guard"
-version = "0.2.8"
+name = "codexcomp"
+version = "0.3.0"
 description = "Local Responses proxy for OpenAI Codex CLI: folds gpt-5.5 518n-2 reasoning truncation (516 degradation) via the official openai_base_url wiring — no provider change, WebSocket-first, no fallback noise."
 readme = "README.md"
 license = "MIT"
@@ -26,21 +26,21 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dzshzx/codex-516-guard"
-Repository = "https://github.com/dzshzx/codex-516-guard"
-Issues = "https://github.com/dzshzx/codex-516-guard/issues"
+Homepage = "https://github.com/dzshzx/codexcomp"
+Repository = "https://github.com/dzshzx/codexcomp"
+Issues = "https://github.com/dzshzx/codexcomp/issues"
 
 [project.scripts]
-codex-516-guard = "guard.cli:main"
+codexcomp = "codexcomp.cli:main"
 
 # Windowless launcher (GUI subsystem on Windows → no console window at logon).
 # Use it as the target of a manually-created Startup shortcut on Windows.
 [project.gui-scripts]
-codex-516-guardw = "guard.cli:main"
+codexcompw = "codexcomp.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["guard"]
+packages = ["codexcomp"]

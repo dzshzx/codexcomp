@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-log = logging.getLogger("guard.fold")
+log = logging.getLogger("codexcomp.fold")
 
 STEP = 518
 MIN_N = 1          # continue only when truncation tier n >= MIN_N

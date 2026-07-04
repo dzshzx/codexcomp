@@ -1,8 +1,8 @@
-# codex-516-guard
+# codexcomp
 
-[![PyPI](https://img.shields.io/pypi/v/codex-516-guard.svg)](https://pypi.org/project/codex-516-guard/)
-[![Python](https://img.shields.io/pypi/pyversions/codex-516-guard.svg)](https://pypi.org/project/codex-516-guard/)
-[![License: MIT](https://img.shields.io/pypi/l/codex-516-guard.svg)](https://github.com/dzshzx/codex-516-guard/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![Python](https://img.shields.io/pypi/pyversions/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![License: MIT](https://img.shields.io/pypi/l/codexcomp.svg)](https://github.com/dzshzx/codexcomp/blob/main/LICENSE)
 
 **English** · [简体中文](README.zh-CN.md)
 
@@ -11,8 +11,8 @@ A tiny local Responses proxy for the **OpenAI Codex CLI** that cures the gpt-5.5
 untouched, so session grouping, remote compaction and remote-control keep working.
 
 ```bash
-uv tool install codex-516-guard      # install
-codex-516-guard                      # run (127.0.0.1:8787)
+uv tool install codexcomp      # install
+codexcomp                      # run (127.0.0.1:8787)
 # then add one line to ~/.codex/config.toml:  openai_base_url = "http://127.0.0.1:8787/v1"
 ```
 
@@ -31,14 +31,14 @@ When a turn lands on that fingerprint, the model stops thinking early and the an
 quality drops sharply. It is an upstream issue with no official fix
 ([openai/codex#30364](https://github.com/openai/codex/issues/30364)).
 
-`codex-516-guard` sits on `127.0.0.1` between Codex and the upstream Responses API.
+`codexcomp` sits on `127.0.0.1` between Codex and the upstream Responses API.
 When it sees a turn truncate on the `518n−2` fingerprint, it **makes the model keep
 thinking** and **folds the extra rounds into a single downstream response**, so Codex
 sees one clean, complete answer.
 
 ## How it works
 
-The proxy streams every upstream round and runs a small state machine (`guard/fold.py`):
+The proxy streams every upstream round and runs a small state machine (`codexcomp/fold.py`):
 
 1. **Detect.** At the end of each round it reads
    `usage.output_tokens_details.reasoning_tokens`. If it equals `518n − 2` (with
@@ -78,7 +78,7 @@ This is the officially supported key
 The 518n−2 detection + fold-continuation mechanism is [CodexCont]'s idea; the
 implementation here is new and diverges on a few deliberate points:
 
-|  | codex-516-guard | CodexCont |
+|  | codexcomp | CodexCont |
 | --- | --- | --- |
 | **Codex wiring** | top-level `openai_base_url` (**built-in provider unchanged**) | a new `[model_providers]` entry (history hidden per-provider, remote-control unusable, remote compaction lost) |
 | **Downstream transport** | **WebSocket-first** — full `responses_websockets` protocol, plus SSE fallback | SSE only (Codex tries ws → 405 → ~5 reconnect warnings per session, then falls back) |
@@ -94,24 +94,24 @@ Requires [uv](https://docs.astral.sh/uv/) (which manages Python for you) and the
 CLI (ChatGPT OAuth login; tested on 0.142.x).
 
 ```bash
-uv tool install codex-516-guard          # from PyPI
+uv tool install codexcomp          # from PyPI
 # or straight from source:
-# uv tool install git+https://github.com/dzshzx/codex-516-guard
+# uv tool install git+https://github.com/dzshzx/codexcomp
 ```
 
 uv puts the executable in its bin dir (`~/.local/bin` on Unix/macOS; on Windows run
-`where.exe codex-516-guard`; `uv tool update-shell` adds it to PATH). Then:
+`where.exe codexcomp`; `uv tool update-shell` adds it to PATH). Then:
 
 ```bash
-codex-516-guard                          # run in foreground (default 127.0.0.1:8787)
-codex-516-guard --port 8790 --log-level debug
+codexcomp                          # run in foreground (default 127.0.0.1:8787)
+codexcomp --port 8790 --log-level debug
 ```
 
 Wire Codex to it (one line in `~/.codex/config.toml`, see above), and you're done.
 **Disable** by commenting out the `openai_base_url` line and stopping the proxy. (If the
 key stays but the proxy is down, Codex errors on an unreachable upstream.)
 
-Upgrade / uninstall: `uv tool upgrade codex-516-guard` / `uv tool uninstall codex-516-guard`.
+Upgrade / uninstall: `uv tool upgrade codexcomp` / `uv tool uninstall codexcomp`.
 
 ### Ports
 
@@ -128,8 +128,8 @@ free port and prints which `openai_base_url` to use. Don't use it for a wired se
 Installing registers **no** autostart — it's entirely your choice.
 
 ```bash
-codex-516-guard install-service     # register + start (current platform)
-codex-516-guard uninstall-service   # remove
+codexcomp install-service     # register + start (current platform)
+codexcomp uninstall-service   # remove
 ```
 
 `install-service` picks the per-user, runs-in-your-session mechanism (a system service
@@ -138,7 +138,7 @@ proxy settings under your profile):
 
 - **Linux / WSL** → a systemd **user** unit (`~/.config/systemd/user/`). Run
   `loginctl enable-linger` once to start it at boot without logging in. Manual equivalent:
-  see `systemd/codex-516-guard.service.example`.
+  see `systemd/codexcomp.service.example`.
 - **macOS** → a launchd **LaunchAgent** in `~/Library/LaunchAgents/` (starts at login, in
   your GUI session). Load with `launchctl bootstrap gui/$(id -u) <plist>` /
   `launchctl kickstart -k …`; remove with `launchctl bootout …`.
@@ -151,12 +151,12 @@ launches a hidden process trips behavioral antivirus as trojan-like persistence 
 Kaspersky's proactive-defense module flags the launching `python.exe` as
 `PDM:Trojan.Win32.Generic`. A **user-created** Startup shortcut is trusted by the same AV.
 
-So this package ships a windowless launcher, `codex-516-guardw` (a Windows GUI-subsystem
+So this package ships a windowless launcher, `codexcompw` (a Windows GUI-subsystem
 exe — no console window at logon), and `install-service` just tells you how to point a
 shortcut at it:
 
 1. `Win+R` → `shell:startup` (opens the Startup folder).
-2. New → Shortcut → target = the path from `where.exe codex-516-guardw` (append
+2. New → Shortcut → target = the path from `where.exe codexcompw` (append
    `--port N` if you use a custom port).
 
 Delete the shortcut to disable it.
@@ -173,7 +173,7 @@ that Windows Codex depends on the WSL proxy being up).
 
 ```bash
 curl -sS http://127.0.0.1:8787/healthz            # {"ok":true,...}
-journalctl --user -u codex-516-guard -f | grep -E 'round|done'   # Linux/WSL
+journalctl --user -u codexcomp -f | grep -E 'round|done'   # Linux/WSL
 ```
 
 A live fold looks like this (two chained 516s beaten, answer correct):
@@ -188,10 +188,10 @@ done: 3 round(s) | ... | status=completed stop=natural
 ## Develop
 
 ```bash
-git clone https://github.com/dzshzx/codex-516-guard && cd codex-516-guard
+git clone https://github.com/dzshzx/codexcomp && cd codexcomp
 uv sync
 uv run python test_fold.py        # fold state-machine self-test → ALL PASS
-uv run codex-516-guard            # run locally
+uv run codexcomp            # run locally
 ```
 
 Releases go out via PyPI Trusted Publishing (`.github/workflows/release.yml`, OIDC, no
@@ -199,11 +199,11 @@ stored token): push a `v*` tag and it builds + publishes automatically.
 
 Layout:
 
-- `guard/fold.py` — fingerprint detection + fold state machine (transport-agnostic;
+- `codexcomp/fold.py` — fingerprint detection + fold state machine (transport-agnostic;
   covered by `test_fold.py`).
-- `guard/server.py` — starlette transport: ws / SSE downstream, SSE upstream,
+- `codexcomp/server.py` — starlette transport: ws / SSE downstream, SSE upstream,
   zstd/gzip request decompression, `/v1/*` passthrough.
-- `guard/cli.py` — CLI entry (`codex-516-guard`; loopback only; auth passthrough, stores
+- `codexcomp/cli.py` — CLI entry (`codexcomp`; loopback only; auth passthrough, stores
   no credentials).
 
 ## Security & disclaimer
@@ -214,14 +214,14 @@ Layout:
 - **Unofficial**: it depends on upstream behavior that isn't a public contract (the
   truncation fingerprint, the ws frame format). An OpenAI-side change may break it. Use at
   your own risk.
-- Continuation spends **extra real tokens** (see `metadata.proxy_billed_usage`); the guard
+- Continuation spends **extra real tokens** (see `metadata.proxy_billed_usage`); codexcomp
   bounds this with an `n` window and a 3-round cap.
 
 ## Community
 
 Built for and shared with the [**LINUX DO**](https://linux.do) community, where the
 gpt-5.5 "516" degradation was diagnosed and discussed. Feedback and issues welcome there
-and on [GitHub Issues](https://github.com/dzshzx/codex-516-guard/issues).
+and on [GitHub Issues](https://github.com/dzshzx/codexcomp/issues).
 
 ## License
 

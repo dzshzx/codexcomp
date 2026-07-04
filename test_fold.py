@@ -5,7 +5,7 @@ Run: uv run python test_fold.py
 import asyncio
 import json
 
-from guard.fold import DONE, fold, STEP
+from codexcomp.fold import DONE, fold, STEP
 
 
 def reasoning_round(rid: str, reasoning_toks: int, text: str | None, enc: bool = True):

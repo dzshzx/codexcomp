@@ -1,6 +1,6 @@
 """Optional autostart registration — strictly opt-in.
 
-`codex-516-guard install-service` writes and activates a per-user autostart entry
+`codexcomp install-service` writes and activates a per-user autostart entry
 for the current platform; `uninstall-service` removes it. Plain `uv tool install`
 never touches any of this — autostart is always the user's explicit choice.
 
@@ -17,8 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-LABEL = "codex-516-guard"
-MAC_LABEL = "com.dzshzx.codex-516-guard"
+LABEL = "codexcomp"
+MAC_LABEL = "com.dzshzx.codexcomp"
 
 
 def _resolve_exe() -> str:
@@ -74,7 +74,7 @@ def _install_linux(argv: list[str]) -> None:
             "see the systemd example in the project README.")
     exec_start = " ".join(argv)
     unit = f"""[Unit]
-Description=codex-516-guard: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
+Description=codexcomp: local Responses proxy folding gpt-5.5 518n-2 reasoning truncation
 After=network-online.target
 
 [Service]
@@ -94,7 +94,7 @@ WantedBy=default.target
     _run(["systemctl", "--user", "enable", "--now", f"{LABEL}.service"])
     print(f"installed + started systemd user service: {path}")
     print("  tip: run 'loginctl enable-linger' once to start it at boot without login")
-    print(f"  disable: codex-516-guard uninstall-service   (or systemctl --user disable --now {LABEL})")
+    print(f"  disable: codexcomp uninstall-service   (or systemctl --user disable --now {LABEL})")
 
 
 def _uninstall_linux() -> None:
@@ -143,7 +143,7 @@ def _install_macos(argv: list[str]) -> None:
     _run(["launchctl", "kickstart", "-k", f"gui/{uid}/{MAC_LABEL}"], check=False)
     print(f"installed + started launchd LaunchAgent: {path}")
     print(f"  logs: {log}")
-    print("  disable: codex-516-guard uninstall-service")
+    print("  disable: codexcomp uninstall-service")
 
 
 def _uninstall_macos() -> None:
@@ -166,7 +166,7 @@ def _uninstall_macos() -> None:
 
 
 def _guiw_exe() -> str:
-    """The windowless launcher (codex-516-guardw.exe) beside the console exe."""
+    """The windowless launcher (codexcompw.exe) beside the console exe."""
     console = _resolve_exe()
     if console.lower().endswith(".exe"):
         cand = console[:-4] + "w.exe"
@@ -186,11 +186,11 @@ def _install_windows(argv: list[str]) -> None:
     print(f"  2. create a shortcut whose target is:  {exe_w}")
     if extra:
         print(f"     append these arguments:  {extra}")
-    print("  (…guardw.exe is windowless — no console window at logon)")
+    print("  (…codexcompw.exe is windowless — no console window at logon)")
 
 
 def _uninstall_windows() -> None:
-    print("Windows autostart is manual: delete your codex-516-guard shortcut from")
+    print("Windows autostart is manual: delete your codexcomp shortcut from")
     print("the Startup folder (Win+R -> shell:startup).")
 
 
