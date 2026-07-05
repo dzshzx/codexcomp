@@ -1,21 +1,27 @@
+<div align="center">
+
 # codexcomp
+
+**Codex + Complete** — a lightweight local proxy that folds gpt-5.5's **"516" reasoning
+truncation** into complete, untruncated answers for the [OpenAI Codex CLI](https://github.com/openai/codex).
 
 [![PyPI](https://img.shields.io/pypi/v/codexcomp.svg)](https://pypi.org/project/codexcomp/)
 [![Python](https://img.shields.io/pypi/pyversions/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![Downloads](https://img.shields.io/pypi/dm/codexcomp.svg)](https://pypi.org/project/codexcomp/)
 [![License: MIT](https://img.shields.io/pypi/l/codexcomp.svg)](https://github.com/dzshzx/codexcomp/blob/main/LICENSE)
 
 **English** · [简体中文](README.zh-CN.md)
 
-A lightweight local Responses proxy for the **OpenAI Codex CLI** that mitigates gpt-5.5's
-**"516" reasoning truncation** — it overrides the built-in provider's base URL in place, so
-`model_provider` is unchanged and session grouping, remote compaction, and remote-control
-keep working.
+</div>
 
 ```bash
 uv tool install codexcomp      # install
 codexcomp                      # run (127.0.0.1:8787)
 # then append to ~/.codex/config.toml:  openai_base_url = "http://127.0.0.1:8787/v1"
 ```
+
+It overrides the built-in provider's base URL **in place** — `model_provider` is unchanged,
+so session grouping, remote compaction, and remote-control keep working.
 
 > **Credits.** The detect-and-continue mechanism originates from
 > [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont) (MIT); this is an
@@ -27,12 +33,54 @@ codexcomp                      # run (127.0.0.1:8787)
 
 gpt-5.5's reasoning is intermittently truncated at `reasoning_tokens == 518·n − 2`
 (**516, 1034, 1552, …**): the turn stops mid-reasoning and answers from an incomplete
-thought, degrading quality sharply. It's an upstream defect with no official fix
+thought, degrading quality sharply. Aggregate telemetry in the upstream report shows ~44 %
+of gpt-5.5 responses that reach 516 reasoning tokens end at exactly that boundary — an
+upstream defect with no official fix
 ([openai/codex#30364](https://github.com/openai/codex/issues/30364)).
 
 `codexcomp` sits on `127.0.0.1` between Codex and the upstream Responses API. On a `518n−2`
 truncation it drives the model to keep reasoning and folds the extra rounds into a single
 downstream response — Codex sees one complete, untruncated answer.
+
+## Features
+
+- **Detect → continue → fold** — spots the `518n−2` fingerprint, replays the round's
+  reasoning with a continue nudge, and folds all rounds into one response.
+- **Zero-footprint wiring** — one official top-level `openai_base_url` key; no
+  `[model_providers]` entry, no provider id change, no session re-bucketing.
+- **WebSocket-first transport** — native `responses_websockets` protocol (envelope frames,
+  serial connection reuse, prewarm); no "Falling back" noise in Codex logs.
+- **Resilient SSE fallback** — the POST path transparently decompresses zstd/gzip upstream
+  responses.
+- **Full `/v1/*` passthrough** — including `GET /v1/models` (model catalog refresh).
+- **Live streaming** — reasoning streams in real time even mid-fold; only the final clean
+  round's output is released downstream.
+- **Honest accounting** — the true cumulative cost of folded rounds is reported under
+  `metadata.proxy_billed_usage`.
+- **Loopback-only, auth passthrough** — forwards Codex's `Authorization` header; never
+  reads, persists, or logs a credential.
+- **Opt-in autostart** — installation registers nothing; one command sets up a systemd user
+  unit (Linux/WSL) or LaunchAgent (macOS).
+
+## Quick start
+
+Requires [uv](https://docs.astral.sh/uv/) and the Codex CLI (ChatGPT OAuth; tested on 0.142.x).
+
+```bash
+uv tool install codexcomp                                  # from PyPI
+# uv tool install git+https://github.com/dzshzx/codexcomp  # or from source
+codexcomp                                                  # foreground, 127.0.0.1:8787
+```
+
+Point Codex at the proxy with one top-level config key:
+
+```toml
+# ~/.codex/config.toml  (top level, before the first [table])
+openai_base_url = "http://127.0.0.1:8787/v1"
+```
+
+That's it. Disable by removing that line and stopping the proxy; upgrade / uninstall with
+`uv tool upgrade codexcomp` / `uv tool uninstall codexcomp`.
 
 ## How it works
 
@@ -46,38 +94,24 @@ A state machine (`codexcomp/fold.py`) runs per round:
 3. **Fold** — stream reasoning live, flush only the final clean round, and rebuild the terminal
    event as one response (reasoning summed, true cost under `metadata.proxy_billed_usage`).
 
-## Wiring
+## CLI reference
 
-One top-level config key points Codex at the proxy:
+| Command | Description |
+| --- | --- |
+| `codexcomp` / `codexcomp run` | Start the proxy in the foreground. |
+| `codexcomp install-service` | Opt-in autostart registration for the current platform. |
+| `codexcomp uninstall-service` | Remove the autostart entry. |
+| `codexcompw` | Windowless entry (Windows); logs to `%LOCALAPPDATA%\codexcomp\codexcompw.log`. |
 
-```toml
-# ~/.codex/config.toml  (top level, before the first [table])
-openai_base_url = "http://127.0.0.1:8787/v1"
-```
-
-It overrides the base URL of the built-in `openai` provider in place. The provider id stays
-`openai`, so history isn't re-bucketed, remote compaction stays on, and remote-control is
-untouched — unlike a separate `[model_providers]` entry.
-
-## Install
-
-Requires [uv](https://docs.astral.sh/uv/) and the Codex CLI (ChatGPT OAuth; tested on 0.142.x).
-
-```bash
-uv tool install codexcomp                                  # from PyPI
-# uv tool install git+https://github.com/dzshzx/codexcomp  # or from source
-```
-
-Run `codexcomp` (foreground, `127.0.0.1:8787`) and wire Codex with the config line above.
-Disable by removing that line and stopping the proxy; upgrade / uninstall with
-`uv tool upgrade codexcomp` / `uv tool uninstall codexcomp`.
-
-The port must match `openai_base_url`; if 8787 is busy the proxy exits — pass `--port N` and
-update `openai_base_url` to match.
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--host` | `127.0.0.1` | Bind address — keep it loopback. |
+| `--port` | `8787` | Must match `openai_base_url`; if busy the proxy exits. |
+| `--auto-port` | off | Interactive one-off runs only: scan for the next free port and print it. |
+| `--upstream` | `https://chatgpt.com/backend-api/codex` | Upstream base URL. |
+| `--log-level` | `info` | One of `critical` / `error` / `warning` / `info` / `debug`. |
 
 ## Autostart (optional, off by default)
-
-Installation registers nothing; opt in explicitly.
 
 ```bash
 codexcomp install-service     # register + start (current platform)
@@ -109,7 +143,41 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
-## Develop
+## FAQ
+
+**Does it touch normal turns?**
+No. Clean rounds pass through byte-for-byte; the fold path only engages on a detected
+`518n−2` truncation.
+
+**What does a fold cost?**
+Continuation rounds spend extra real tokens, bounded by the `n` window (`1 ≤ n ≤ 6`) and a
+3-continuation cap. The true cumulative usage is reported under
+`metadata.proxy_billed_usage`.
+
+**What happens when OpenAI fixes this upstream?**
+Nothing breaks — the detector simply stops firing and the proxy becomes a transparent
+passthrough. Unwire it by deleting the `openai_base_url` line whenever you like.
+
+**Why not a separate `[model_providers]` entry?**
+That changes the provider id, which re-buckets session history and drops remote compaction
+and remote-control. `openai_base_url` is the official in-place override of the built-in
+`openai` provider.
+
+**Is my credential safe?**
+The proxy forwards the `Authorization` header untouched and binds to loopback only; it never
+reads, persists, or logs a credential.
+
+## Security & disclaimer
+
+- **Auth passthrough only** — forwards Codex's `Authorization` header; never reads, persists,
+  or logs a credential.
+- **Loopback only** — do not expose it on a non-loopback interface.
+- **Unofficial** — it relies on non-contract upstream behavior; an OpenAI-side change may break
+  it. Use at your own risk.
+- Continuation spends **extra real tokens** (`metadata.proxy_billed_usage`), bounded by an `n`
+  window and a 3-round cap.
+
+## Development
 
 ```bash
 git clone https://github.com/dzshzx/codexcomp && cd codexcomp
@@ -121,15 +189,12 @@ uv run codexcomp                  # run locally
 Releases go out via PyPI Trusted Publishing (OIDC, no stored token): push a `v*` tag to build
 and publish.
 
-## Security & disclaimer
+## Contributing
 
-- **Auth passthrough only** — forwards Codex's `Authorization` header; never reads, persists,
-  or logs a credential.
-- **Loopback only** — do not expose it on a non-loopback interface.
-- **Unofficial** — it relies on non-contract upstream behavior; an OpenAI-side change may break
-  it. Use at your own risk.
-- Continuation spends **extra real tokens** (`metadata.proxy_billed_usage`), bounded by an `n`
-  window and a 3-round cap.
+Bug reports, fold-log excerpts, and reproduction details are the most valuable
+contributions — please file them on
+[GitHub Issues](https://github.com/dzshzx/codexcomp/issues). For code changes, run
+`uv run python test_fold.py` before opening a PR and keep changes focused.
 
 ## Community
 

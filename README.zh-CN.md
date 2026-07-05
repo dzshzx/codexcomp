@@ -1,20 +1,27 @@
+<div align="center">
+
 # codexcomp
+
+**Codex + Complete** — 面向 [OpenAI Codex CLI](https://github.com/openai/codex) 的轻量本地代理，
+将 gpt-5.5 的**「516 降智」推理截断**折叠为完整、未截断的答案。
 
 [![PyPI](https://img.shields.io/pypi/v/codexcomp.svg)](https://pypi.org/project/codexcomp/)
 [![Python](https://img.shields.io/pypi/pyversions/codexcomp.svg)](https://pypi.org/project/codexcomp/)
+[![Downloads](https://img.shields.io/pypi/dm/codexcomp.svg)](https://pypi.org/project/codexcomp/)
 [![License: MIT](https://img.shields.io/pypi/l/codexcomp.svg)](https://github.com/dzshzx/codexcomp/blob/main/LICENSE)
 
 [English](README.md) · **简体中文**
 
-面向 **OpenAI Codex CLI** 的轻量本地 Responses 代理，用于消解 gpt-5.5 的
-**「516 降智」推理截断**——它就地覆盖内置 provider 的 base URL，**不改动 `model_provider`**，
-因此会话分组、远程压缩与 remote-control 均不受影响。
+</div>
 
 ```bash
 uv tool install codexcomp      # 安装
 codexcomp                      # 运行（127.0.0.1:8787）
 # 随后在 ~/.codex/config.toml 顶层追加：  openai_base_url = "http://127.0.0.1:8787/v1"
 ```
+
+它**就地覆盖**内置 provider 的 base URL——`model_provider` 不变，因此会话分组、远程压缩与
+remote-control 均不受影响。
 
 > **致谢。** 「检测截断 + 续写」的机制思路源自
 > [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont)（MIT）；本项目为独立的
@@ -25,11 +32,49 @@ codexcomp                      # 运行（127.0.0.1:8787）
 ## 问题
 
 gpt-5.5 的推理偶发在 `reasoning_tokens == 518·n − 2`（**516、1034、1552 …**）处被截断：该轮推理
-中途终止、基于不完整的思考给出答案，质量骤降。此为上游缺陷，尚无官方修复
+中途终止、基于不完整的思考给出答案，质量骤降。上游报告的聚合遥测显示，gpt-5.5 达到 516 推理
+token 的响应中约 44 % 恰好停在该边界——此为上游缺陷，尚无官方修复
 （[openai/codex#30364](https://github.com/openai/codex/issues/30364)）。
 
 `codexcomp` 监听 `127.0.0.1`，位于 Codex 与上游 Responses API 之间。命中 `518n−2` 截断时，
 它驱动模型继续推理，并将多出的续写轮折叠为单个下游响应——Codex 收到的是一次完整、未截断的答案。
+
+## 特性
+
+- **检测 → 续写 → 折叠** — 识别 `518n−2` 指纹，重放该轮 reasoning 并附续写提示，将全部轮次
+  折叠为单个响应。
+- **零侵入接线** — 仅一个官方顶层 `openai_base_url` key；不加 `[model_providers]` 条目、
+  不改 provider id、会话历史不重新分桶。
+- **WebSocket 第一传输** — 原生实现 `responses_websockets` 协议（信封帧、同连接串行复用、
+  prewarm）；Codex 日志中零「Falling back」噪音。
+- **健壮的 SSE 兜底** — POST 路径自动解压 zstd/gzip 上游响应。
+- **完整 `/v1/*` 透传** — 含 `GET /v1/models`（模型目录刷新）。
+- **实时流式** — 折叠过程中推理流全程实时透传；仅放行收尾轮的最终输出。
+- **如实计费** — 折叠各轮的真实累计开销记于 `metadata.proxy_billed_usage`。
+- **仅回环 + auth passthrough** — 透传 Codex 的 `Authorization` 头，不读取、不持久化、
+  不记录任何凭据。
+- **自启 opt-in** — 安装不注册任何自启项；一条命令生成 systemd user unit（Linux/WSL）或
+  LaunchAgent（macOS）。
+
+## 快速开始
+
+依赖 [uv](https://docs.astral.sh/uv/) 与 Codex CLI（ChatGPT OAuth 登录；在 0.142.x 上验证）。
+
+```bash
+uv tool install codexcomp                                  # 从 PyPI 安装
+# uv tool install git+https://github.com/dzshzx/codexcomp  # 或从源码安装
+codexcomp                                                  # 前台运行，127.0.0.1:8787
+```
+
+用一个顶层 config key 将 Codex 指向代理：
+
+```toml
+# ~/.codex/config.toml  （顶层，须位于第一个 [table] 之前）
+openai_base_url = "http://127.0.0.1:8787/v1"
+```
+
+就这些。**停用**：删除该行并停止代理；升级 / 卸载用 `uv tool upgrade codexcomp` /
+`uv tool uninstall codexcomp`。
 
 ## 工作原理
 
@@ -41,37 +86,24 @@ gpt-5.5 的推理偶发在 `reasoning_tokens == 518·n − 2`（**516、1034、1
 3. **折叠** — 推理流全程实时透传，仅放行收尾轮的最终输出，并将 terminal 事件重建为单个响应
    （reasoning 累加，真实累计开销记于 `metadata.proxy_billed_usage`）。
 
-## 接线
+## CLI 参考
 
-一个顶层 config key 将 Codex 指向代理：
+| 命令 | 说明 |
+| --- | --- |
+| `codexcomp` / `codexcomp run` | 前台启动代理。 |
+| `codexcomp install-service` | opt-in：注册当前平台的自启项。 |
+| `codexcomp uninstall-service` | 撤销自启项。 |
+| `codexcompw` | 无窗口入口（Windows）；日志写入 `%LOCALAPPDATA%\codexcomp\codexcompw.log`。 |
 
-```toml
-# ~/.codex/config.toml  （顶层，须位于第一个 [table] 之前）
-openai_base_url = "http://127.0.0.1:8787/v1"
-```
-
-它就地覆盖内置 `openai` provider 的 base URL。provider id 仍为 `openai`，因此会话历史不会按
-provider 重新分桶、远程压缩保持可用、remote-control 不受影响——这与单独的 `[model_providers]`
-条目不同。
-
-## 安装
-
-依赖 [uv](https://docs.astral.sh/uv/) 与 Codex CLI（ChatGPT OAuth 登录；在 0.142.x 上验证）。
-
-```bash
-uv tool install codexcomp                                  # 从 PyPI 安装
-# uv tool install git+https://github.com/dzshzx/codexcomp  # 或从源码安装
-```
-
-运行 `codexcomp`（前台，`127.0.0.1:8787`），并按上面的配置行将 Codex 接入。**停用**：删除该行并
-停止代理；升级 / 卸载用 `uv tool upgrade codexcomp` / `uv tool uninstall codexcomp`。
-
-端口须与 `openai_base_url` 一致；若 8787 被占用，代理会报错退出——用 `--port N` 并同步
-`openai_base_url`。
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--host` | `127.0.0.1` | 绑定地址——请保持回环。 |
+| `--port` | `8787` | 须与 `openai_base_url` 一致；被占用时报错退出。 |
+| `--auto-port` | 关 | 仅限交互式临时运行：扫描下一个空闲端口并打印。 |
+| `--upstream` | `https://chatgpt.com/backend-api/codex` | 上游 base URL。 |
+| `--log-level` | `info` | `critical` / `error` / `warning` / `info` / `debug` 之一。 |
 
 ## 开机自启（可选，默认关闭）
-
-安装本身不注册任何自启项，需显式启用。
 
 ```bash
 codexcomp install-service     # 注册并启动（当前平台）
@@ -102,6 +134,32 @@ round 3: in=22606 out=566 reason=291 total=23172 | n=None buffered=[...] -> clea
 done: 3 round(s) | ... | status=completed stop=natural
 ```
 
+## 常见问题
+
+**会影响正常（未截断）的轮次吗？**
+不会。干净轮次逐字节透传；折叠路径只在检出 `518n−2` 截断时介入。
+
+**一次折叠的代价是什么？**
+续写轮会消耗额外的实际 token，由 `n` 窗口（`1 ≤ n ≤ 6`）与 3 轮续写上限约束。真实累计用量
+记于 `metadata.proxy_billed_usage`。
+
+**上游修复之后怎么办？**
+无需任何操作——检测器不再命中，代理退化为透明透传。随时删除 `openai_base_url` 行即可脱线。
+
+**为什么不用单独的 `[model_providers]` 条目？**
+那会改变 provider id：会话历史按 provider 重新分桶，远程压缩与 remote-control 也随之失效。
+`openai_base_url` 是就地覆盖内置 `openai` provider 的官方路径。
+
+**我的凭据安全吗？**
+代理原样透传 `Authorization` 头且仅绑定回环，不读取、不持久化、不记录任何凭据。
+
+## 安全与免责
+
+- **仅 auth passthrough** — 透传 Codex 的 `Authorization` 头，不读取、不持久化、不记录任何凭据。
+- **仅回环** — 请勿暴露于非回环接口。
+- **非官方** — 依赖上游非公开契约的行为，OpenAI 侧变更可能使其失效，风险自负。
+- 续写会消耗**额外的实际 token**（`metadata.proxy_billed_usage`），由 `n` 窗口与 3 轮上限约束。
+
 ## 开发
 
 ```bash
@@ -113,12 +171,11 @@ uv run codexcomp                  # 本地运行
 
 发布经 PyPI Trusted Publishing（OIDC，无存储 token）：推 `v*` tag 即自动构建并上传。
 
-## 安全与免责
+## 参与贡献
 
-- **仅 auth passthrough** — 透传 Codex 的 `Authorization` 头，不读取、不持久化、不记录任何凭据。
-- **仅回环** — 请勿暴露于非回环接口。
-- **非官方** — 依赖上游非公开契约的行为，OpenAI 侧变更可能使其失效，风险自负。
-- 续写会消耗**额外的实际 token**（`metadata.proxy_billed_usage`），由 `n` 窗口与 3 轮上限约束。
+最有价值的贡献是 bug 报告、折叠日志片段与复现细节——请提交到
+[GitHub Issues](https://github.com/dzshzx/codexcomp/issues)。代码改动请在提 PR 前运行
+`uv run python test_fold.py`，并保持改动聚焦。
 
 ## 社区
 
