@@ -35,20 +35,30 @@ def _bind_headless_streams() -> None:
         sys.stderr = stream
 
 
-def _add_run_flags(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--host", default=DEFAULT_HOST,
+_RUN_FLAG_DEFAULTS = {"host": DEFAULT_HOST, "port": DEFAULT_PORT, "upstream": None,
+                      "log_level": "info", "max_n": None, "max_continue": None}
+
+
+def _add_run_flags(p: argparse.ArgumentParser, *, subcommand: bool = False) -> None:
+    # Subparsers get SUPPRESS defaults: with a real default they would clobber
+    # a value the top-level parser already read (`codexcomp --port 9999 run`
+    # would silently run on 8787). Missing attrs are backfilled after parsing.
+    def dflt(key: str):
+        return argparse.SUPPRESS if subcommand else _RUN_FLAG_DEFAULTS[key]
+
+    p.add_argument("--host", default=dflt("host"),
                    help=f"bind address (default: {DEFAULT_HOST}; keep it loopback)")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT,
+    p.add_argument("--port", type=int, default=dflt("port"),
                    help=f"bind port (default: {DEFAULT_PORT}). Must match Codex's openai_base_url; "
                         "if busy the proxy exits (a wired proxy must own its exact port).")
-    p.add_argument("--upstream", default=None,
+    p.add_argument("--upstream", default=dflt("upstream"),
                    help=f"upstream base URL (default: {DEFAULT_UPSTREAM})")
-    p.add_argument("--log-level", default="info",
+    p.add_argument("--log-level", default=dflt("log_level"),
                    choices=["critical", "error", "warning", "info", "debug"])
-    p.add_argument("--max-n", type=int, default=None, metavar="N",
+    p.add_argument("--max-n", type=int, default=dflt("max_n"), metavar="N",
                    help="highest 518n-2 tier to auto-continue, 0 = no cap "
                         f"(default: {fold.MAX_N})")
-    p.add_argument("--max-continue", type=int, default=None, metavar="K",
+    p.add_argument("--max-continue", type=int, default=dflt("max_continue"), metavar="K",
                    help="max continuation rounds per request "
                         f"(default: {fold.MAX_CONTINUE})")
 
@@ -98,13 +108,20 @@ def main() -> None:
     p_install = sub.add_parser(
         "install-service",
         help="opt-in: register autostart (systemd user / launchd / scheduled task)")
-    _add_run_flags(p_install)
+    _add_run_flags(p_install, subcommand=True)
 
     sub.add_parser("uninstall-service", help="remove the autostart entry")
     p_run = sub.add_parser("run", help="start the proxy (default when no subcommand)")
-    _add_run_flags(p_run)
+    _add_run_flags(p_run, subcommand=True)
 
     args = parser.parse_args()
+    for key, value in _RUN_FLAG_DEFAULTS.items():
+        if not hasattr(args, key):  # SUPPRESS left it unset
+            setattr(args, key, value)
+    if args.max_n is not None and args.max_n < 0:
+        parser.error("--max-n must be >= 0 (0 = no cap)")
+    if args.max_continue is not None and args.max_continue < 0:
+        parser.error("--max-continue must be >= 0")
 
     if args.cmd == "install-service":
         raise SystemExit(service.install(args.host, args.port, args.upstream,
