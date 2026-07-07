@@ -14,6 +14,7 @@ Mechanism credit: neteroster/CodexCont (MIT). Implementation is original.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
@@ -33,12 +34,21 @@ TERMINAL_TYPES = ("response.completed", "response.failed", "response.incomplete"
 RoundOpener = Callable[[dict[str, Any]], Awaitable[AsyncIterator[dict[str, Any]]]]
 
 
+_ID_RE = re.compile(r"\b(resp|rs|msg|fc|call)_[A-Za-z0-9_-]{8,}\b")
+
+
+def redact_ids(text: object) -> str:
+    """Redact full upstream ids before logging/presenting proxy errors."""
+    return _ID_RE.sub(lambda m: f"{m.group(1)}_{m.group(0).split('_', 1)[1][:8]}…", str(text))
+
+
 class RoundOpenError(Exception):
     """Continuation round could not be opened (upstream HTTP >= 400)."""
 
     def __init__(self, status: int, detail: str):
-        super().__init__(f"upstream {status}: {detail[:200]}")
+        super().__init__(f"upstream {status}: {redact_ids(detail)[:200]}")
         self.status = status
+        self.detail = detail
 
 
 DONE = object()  # sentinel an opener may yield to signal upstream sent [DONE]
@@ -83,10 +93,9 @@ def next_round_body(
 ) -> dict[str, Any]:
     """Shape the agent's request for one upstream round.
 
-    Preserve previous_response_id whenever Codex supplied it. Codex often sends
-    only incremental input items and relies on that id for server-side history;
-    hidden continuation rounds still need the same base context plus replayed
-    reasoning to avoid losing earlier turns.
+    Preserve previous_response_id for the client-visible round whenever Codex
+    supplied it. Hidden continuation rounds may override/drop it after shaping
+    the body, depending on the continuation strategy.
     """
     body = dict(base_body)
     body["stream"] = True
@@ -180,7 +189,12 @@ def _terminal_event(
     next turn to the clean response, not to an earlier truncated round.
     """
     tresp = (upstream_terminal or {}).get("response") or {}
-    resp = dict(tresp or base_response or {})
+    # Some upstream terminal frames omit fields that were present on
+    # response.created. Start with the current round's created response, then
+    # overlay terminal fields so final folded identity can still chain to the
+    # correct just-produced response id.
+    resp = dict(base_response or {})
+    resp.update(tresp)
     resp["output"] = output
     resp["usage"] = usage
     metadata = dict(resp.get("metadata") or {})
@@ -219,6 +233,7 @@ async def fold(
     summed_usage: dict[str, Any] = {}
     first_usage: dict[str, Any] | None = None
     rounds_info: list[dict[str, Any]] = []
+    continuation_fallback_used = False
 
     def stamp(ev: dict[str, Any]) -> dict[str, Any]:
         nonlocal seq
@@ -243,6 +258,7 @@ async def fold(
         round_reasoning: list[dict[str, Any]] = []
         terminal: dict[str, Any] | None = None
         usage: dict[str, Any] | None = None
+        round_response: dict[str, Any] | None = None
 
         try:
             async for ev in events:
@@ -252,9 +268,12 @@ async def fold(
                 etype = ev.get("type", "")
 
                 if etype in ("response.created", "response.in_progress"):
+                    resp = ev.get("response") or {}
+                    if resp.get("id"):
+                        round_response = resp
                     if round_no == 1:
                         if etype == "response.created":
-                            base_response = ev.get("response") or {}
+                            base_response = resp
                         yield stamp(ev)
                     continue
                 if etype in TERMINAL_TYPES:
@@ -295,7 +314,42 @@ async def fold(
         except RoundOpenError:
             raise  # only raised before any event; handled by caller for round 1
         except (httpx.HTTPError, ConnectionError, TimeoutError, OSError) as exc:
-            log.warning("round %d: upstream error mid-stream: %r", round_no, exc)
+            log.warning("round %d: upstream error mid-stream: %s", round_no, redact_ids(repr(exc)))
+            # If the primary hidden continuation failed because the truncated
+            # response id was not available upstream, retry once with a full
+            # no-previous-response replay only when the client request itself was
+            # already full-context. For incremental Codex turns, silently dropping
+            # previous_response_id would lose context; return incomplete and let
+            # Codex perform its own full replay.
+            if (
+                round_no > 1
+                and not continuation_fallback_used
+                and not base_body.get("previous_response_id")
+                and "previous_response_not_found" in str(exc)
+            ):
+                continuation_fallback_used = True
+                try:
+                    fallback_body = next_round_body(
+                        base_body,
+                        orig_input + reasoning_replay + [commentary_nudge()],
+                    )
+                    fallback_body.pop("previous_response_id", None)
+                    log.info(
+                        "open continuation fallback round %d: previous_response_id=no input_items=%d replay_items=%d",
+                        round_no + 1,
+                        len(fallback_body.get("input") or []),
+                        len(reasoning_replay),
+                    )
+                    events = await open_round(fallback_body)
+                    continue
+                except RoundOpenError as fallback_exc:
+                    log.warning("continuation fallback round %d failed to open: %s", round_no + 1, fallback_exc)
+                except Exception as fallback_exc:
+                    log.warning(
+                        "continuation fallback round %d failed to open: %s",
+                        round_no + 1,
+                        redact_ids(repr(fallback_exc)),
+                    )
             _sum_usage(summed_usage, usage)
             yield stamp(_terminal_event(
                 None, base_response, final_output,
@@ -308,6 +362,19 @@ async def fold(
             raise
 
         # ---- round ended: decide continue / stop ----------------------------
+        # We intentionally stop reading a round as soon as its terminal event is
+        # seen.  For async generators (notably the sticky upstream WebSocket
+        # opener), breaking out of `async for` does not necessarily advance the
+        # generator to its `finally` block immediately.  Close it explicitly so
+        # per-round resources/locks are released before a hidden continuation
+        # opens the next round on the same sticky upstream WebSocket.
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:
+                log.warning("round %d: failed to close upstream event iterator", round_no, exc_info=True)
+
         _sum_usage(summed_usage, usage)
         if round_no == 1:
             first_usage = usage
@@ -345,14 +412,43 @@ async def fold(
             # single trailing nudge rather than accumulating previous nudges.
             reasoning_replay.extend(round_reasoning)
             try:
-                cont_body = next_round_body(
-                    base_body,
-                    orig_input + reasoning_replay + [commentary_nudge()],
-                )
+                terminal_response_id = (terminal.get("response") or {}).get("id")
+                created_response_id = (round_response or {}).get("id")
+                truncated_response_id = terminal_response_id or created_response_id
+                # Do not reuse Codex's original previous_response_id for a hidden
+                # continuation. When the just-truncated upstream response id is
+                # available, follow Codex's delta rule: previous_response_id points
+                # at the prior response and input contains only the new delta. The
+                # truncated response already contains the original input and its
+                # reasoning output server-side, so resending orig_input/reasoning
+                # can duplicate a function_call_output or user message.
+                if truncated_response_id:
+                    cont_body = next_round_body(base_body, [commentary_nudge()])
+                    cont_body["previous_response_id"] = truncated_response_id
+                else:
+                    if base_body.get("previous_response_id"):
+                        log.warning(
+                            "round %d: no current response id for safe hidden continuation; "
+                            "returning incomplete rather than reusing original previous_response_id",
+                            round_no,
+                        )
+                        yield stamp(_terminal_event(
+                            None, round_response or base_response, final_output,
+                            agent_usage(first_usage, summed_usage, usage, flushed_final=False),
+                            rounds_info, summed_usage, "upstream_error",
+                            incomplete_reason="upstream_error"))
+                        return
+                    cont_body = next_round_body(
+                        base_body,
+                        orig_input + reasoning_replay + [commentary_nudge()],
+                    )
+                    cont_body.pop("previous_response_id", None)
                 log.info(
-                    "open continuation round %d: previous_response_id=%s input_items=%d replay_items=%d",
+                    "open continuation round %d: previous_response_id=%s id_source=%s id_prefix=%s input_items=%d replay_items=%d",
                     round_no + 1,
                     "yes" if cont_body.get("previous_response_id") else "no",
+                    "terminal" if terminal_response_id else "created" if created_response_id else "none",
+                    redact_ids(cont_body.get("previous_response_id")) if cont_body.get("previous_response_id") else None,
                     len(cont_body.get("input") or []),
                     len(reasoning_replay),
                 )
@@ -389,7 +485,7 @@ async def fold(
         log.info("done: %d round(s) | %s | status=%s stop=%s",
                  round_no, _fmt(summed_usage), status, stopped_reason or "natural")
         yield stamp(_terminal_event(
-            terminal, base_response, final_output,
+            terminal, round_response or base_response, final_output,
             agent_usage(first_usage, summed_usage, usage, flushed_final=True),
             rounds_info, summed_usage, stopped_reason))
         if saw_done:

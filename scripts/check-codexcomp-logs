@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UNIT="codexcomp.service"
+SINCE="10 minutes ago"
+TAIL_LINES=180
+FOLLOW=0
+HEALTH_URL="http://127.0.0.1:8788/healthz"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/check-codexcomp-logs [options]
+
+Summarize codexcomp.service health and recent journal logs without printing prompts.
+
+Options:
+  --since VALUE     journalctl --since value (default: "10 minutes ago")
+  --tail N          focused tail lines to show (default: 180)
+  --follow, -f      follow focused log lines after summary
+  --unit VALUE      systemd user unit (default: codexcomp.service)
+  --no-health       skip /healthz check
+  -h, --help        show this help
+
+Examples:
+  scripts/check-codexcomp-logs
+  scripts/check-codexcomp-logs --since '30 minutes ago'
+  scripts/check-codexcomp-logs --since '2026-07-07 06:50:39' --tail 240
+  scripts/check-codexcomp-logs -f
+EOF
+}
+
+DO_HEALTH=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --since)
+      SINCE="${2:?--since requires a value}"
+      shift 2
+      ;;
+    --tail)
+      TAIL_LINES="${2:?--tail requires a number}"
+      shift 2
+      ;;
+    --follow|-f)
+      FOLLOW=1
+      shift
+      ;;
+    --unit)
+      UNIT="${2:?--unit requires a value}"
+      shift 2
+      ;;
+    --no-health)
+      DO_HEALTH=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+redact() {
+  sed -E \
+    -e 's/(Bearer )[A-Za-z0-9._~+\/=-]+/\1[REDACTED]/g' \
+    -e 's/(Authorization: )[A-Za-z0-9._~+\/=-]+/\1[REDACTED]/g' \
+    -e 's/(resp_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(rs_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(msg_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(fc_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+    -e 's/(call_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g' \
+    -e "s/Previous response with id 'resp_[A-Za-z0-9_-]+'/Previous response with id '[REDACTED_RESP]'/g"
+}
+
+focused_re='ws response.create|open round 1|open continuation|open upstream websocket round|upstream websocket connected|upstream websocket first event|upstream websocket terminal|round [0-9]+:|done:|timed out|error frame|previous_response_not_found|response_active|cancelling active|pooled upstream cancel|failed to close upstream event iterator|upstream error mid-stream|connection closed|connection open|400 Bad Request'
+
+now=$(date '+%F %T')
+echo "now=$now"
+echo "unit=$UNIT"
+echo "since=$SINCE"
+
+echo
+systemctl --user --no-pager --full status "$UNIT" | sed -n '1,14p' || true
+
+if [[ "$DO_HEALTH" -eq 1 ]]; then
+  echo
+  echo '--- health ---'
+  curl -fsS "$HEALTH_URL" || true
+  echo
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+journalctl --user -u "$UNIT" --since "$SINCE" --no-pager >"$tmp" || true
+
+echo
+printf '%s\n' '--- counts ---'
+awk '
+/ws response.create/ {creates++}
+/ws response.create/ && /previous_response_id=yes/ {yes++}
+/ws response.create/ && /previous_response_id=no/ {no++}
+/upstream websocket connected: status=101/ {connected++}
+/open upstream websocket round/ {rounds++}
+/upstream websocket first event/ {first++}
+/upstream websocket terminal: type=response.completed status=completed/ {completed++}
+/round [0-9]+: .*-> continue/ {cont_decisions++}
+/open continuation/ {cont_open++}
+/upstream websocket error frame/ {errframe++}
+/upstream websocket timed out/ {timeout++}
+/previous_response_not_found/ {notfound++}
+/400 Bad Request/ {bad400++}
+/response_active/ {active++}
+/cancelling active response/ {cancel++}
+/pooled upstream cancel did not drain/ {canceldrain++}
+/failed to close upstream event iterator/ {closefail++}
+/round [0-9]+: upstream error mid-stream/ {miderr++}
+/connection closed/ {conn_closed++}
+/connection open/ {conn_open++}
+END {
+  printf "creates=%d prev_yes=%d prev_no=%d connected=%d rounds=%d first_events=%d completed=%d\n", creates, yes, no, connected, rounds, first, completed;
+  printf "continue_decisions=%d continuation_opens=%d error_frames=%d timeouts=%d previous_response_not_found=%d http_400=%d response_active=%d\n", cont_decisions, cont_open, errframe, timeout, notfound, bad400, active;
+  printf "cancels=%d cancel_drain_timeouts=%d iterator_close_failures=%d midstream_errors=%d conn_open=%d conn_closed=%d\n", cancel, canceldrain, closefail, miderr, conn_open, conn_closed;
+}' "$tmp"
+
+printf '\n%s\n' '--- suspicious lines ---'
+grep -E 'previous_response_not_found|response_active|timed out|error frame|upstream error mid-stream|pooled upstream cancel|failed to close upstream event iterator|400 Bad Request|round [0-9]+: .*-> continue|open continuation|cancelling active response' "$tmp" \
+  | tail -80 \
+  | redact || true
+
+printf '\n%s\n' "--- focused tail (last ${TAIL_LINES}) ---"
+grep -E "$focused_re" "$tmp" \
+  | tail -"$TAIL_LINES" \
+  | redact || true
+
+if [[ "$FOLLOW" -eq 1 ]]; then
+  printf '\n%s\n' '--- follow focused lines (Ctrl-C to stop) ---'
+  journalctl --user -u "$UNIT" -f --no-pager \
+    | grep --line-buffered -E "$focused_re" \
+    | redact
+fi

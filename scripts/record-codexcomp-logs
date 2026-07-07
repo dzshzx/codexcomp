@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UNIT="codexcomp.service"
+ROOT="/home/abu/launchdb-new/codexcomp"
+LOG_FILE="$ROOT/logs/codexcomp-focused.log"
+PID_FILE="$ROOT/logs/codexcomp-focused.pid"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/record-codexcomp-logs COMMAND [options]
+
+Continuously record redacted focused codexcomp.service logs to a file.
+
+Commands:
+  start             start background recorder
+  stop              stop background recorder
+  restart           stop then start
+  status            show recorder status and log path
+  tail              tail -f the recorded log
+  path              print log path
+
+Options:
+  --file PATH       log file path (default: ./logs/codexcomp-focused.log)
+  --unit NAME       systemd user unit (default: codexcomp.service)
+
+Examples:
+  scripts/record-codexcomp-logs start
+  scripts/record-codexcomp-logs tail
+  scripts/record-codexcomp-logs stop
+EOF
+}
+
+cmd="${1:-}"
+if [[ $# -gt 0 ]]; then shift; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)
+      LOG_FILE="${2:?--file requires a path}"
+      PID_FILE="${LOG_FILE}.pid"
+      shift 2
+      ;;
+    --unit)
+      UNIT="${2:?--unit requires a value}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+focused_re='ws response.create|open round 1|open continuation|open continuation fallback|open upstream websocket round|upstream websocket connected|upstream websocket first event|upstream websocket terminal|round [0-9]+:|done:|timed out|error frame|previous_response_not_found|response_active|cancelling active|pooled upstream cancel|failed to close upstream event iterator|upstream error mid-stream|connection closed|connection open|400 Bad Request'
+
+redact_script='s/(Bearer )[A-Za-z0-9._~+\/=-]+/\1[REDACTED]/g; s/(Authorization: )[A-Za-z0-9._~+\/=-]+/\1[REDACTED]/g; s/(resp_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g; s/(rs_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g; s/(msg_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g; s/(fc_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g; s/(call_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1…/g; s/Previous response with id '\''resp_[A-Za-z0-9_-]+'\''/Previous response with id '\''[REDACTED_RESP]'\''/g'
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+start_recorder() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  if is_running; then
+    echo "already running pid=$(cat "$PID_FILE")"
+    echo "log=$LOG_FILE"
+    return 0
+  fi
+  {
+    echo
+    echo "===== recorder start $(date '+%F %T') unit=$UNIT pid=$$ ====="
+  } >>"$LOG_FILE"
+  setsid bash -c \
+    "journalctl --user -u '$UNIT' -f --since now --no-pager \
+      | grep --line-buffered -E '$focused_re' \
+      | sed -u -E \"$redact_script\" \
+      >> '$LOG_FILE'" \
+    >/dev/null 2>&1 &
+  local pid=$!
+  echo "$pid" >"$PID_FILE"
+  echo "started pid=$pid"
+  echo "log=$LOG_FILE"
+}
+
+stop_recorder() {
+  if ! is_running; then
+    echo "not running"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.5
+  kill -KILL "-$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  echo "stopped pid=$pid"
+}
+
+case "$cmd" in
+  start)
+    start_recorder
+    ;;
+  stop)
+    stop_recorder
+    ;;
+  restart)
+    stop_recorder
+    start_recorder
+    ;;
+  status)
+    if is_running; then
+      echo "running pid=$(cat "$PID_FILE")"
+    else
+      echo "not running"
+    fi
+    echo "log=$LOG_FILE"
+    [[ -f "$LOG_FILE" ]] && ls -lh "$LOG_FILE"
+    ;;
+  tail)
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    tail -f "$LOG_FILE"
+    ;;
+  path)
+    echo "$LOG_FILE"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

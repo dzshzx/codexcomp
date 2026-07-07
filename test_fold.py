@@ -77,20 +77,20 @@ async def main():
     # --- assertions -----------------------------------------------------------
     assert len(opened_bodies) == 3, f"expected 3 rounds, got {len(opened_bodies)}"
 
-    # Every round preserves server-side conversation context when Codex supplied
-    # previous_response_id. Continuation rounds add replayed reasoning and one
-    # trailing commentary nudge.
+    # Round 1 preserves server-side conversation context when Codex supplied
+    # previous_response_id. Hidden continuation rounds must not reuse that
+    # original id; they chain from the just-truncated upstream response id and
+    # follow Codex's delta rule by sending only the new nudge input.
     assert opened_bodies[0]["previous_response_id"] == "resp_previous"
     b2 = opened_bodies[1]
-    assert b2["previous_response_id"] == "resp_previous"
+    assert b2["previous_response_id"] == "resp_1"
     types2 = [i.get("type") for i in b2["input"]]
-    assert types2 == ["message", "reasoning", "message"], types2
+    assert types2 == ["message"], types2
     assert b2["input"][-1]["phase"] == "commentary"
     assert "reasoning.encrypted_content" in b2["include"]
     b3 = opened_bodies[2]
-    assert b3["previous_response_id"] == "resp_previous"
-    assert [i.get("type") for i in b3["input"]] == [
-        "message", "reasoning", "reasoning", "message"]
+    assert b3["previous_response_id"] == "resp_2"
+    assert [i.get("type") for i in b3["input"]] == ["message"]
 
     dict_events = [e for e in out if isinstance(e, dict)]
     # exactly one terminal, and it is the LAST dict event
@@ -124,6 +124,153 @@ async def main():
     otypes = [(i["type"], i.get("id")) for i in term["output"]]
     assert otypes == [("reasoning", "rs_1"), ("reasoning", "rs_2"),
                       ("reasoning", "rs_3"), ("message", "msg_rs_3")], otypes
+
+    # Regression: real terminal frames may omit response.id even though
+    # response.created had it. Continuation must still chain to the current
+    # round response id, not Codex's original previous_response_id.
+    missing_terminal_id_opened = []
+    missing_terminal_id_rounds = [
+        reasoning_round("rs_missing_id_1", STEP - 2, "TRUNCATED", resp_id="resp_created_1"),
+        reasoning_round("rs_missing_id_2", 123, "CLEAN", resp_id="resp_created_2"),
+    ]
+    missing_terminal_id_rounds[0][-1]["response"].pop("id", None)
+
+    async def missing_terminal_id_opener(body):
+        missing_terminal_id_opened.append(body)
+        idx = len(missing_terminal_id_opened) - 1
+
+        async def gen():
+            for ev in missing_terminal_id_rounds[idx]:
+                yield ev
+        return gen()
+
+    missing_terminal_id_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user"}],
+        "previous_response_id": "resp_original_prev",
+    }, missing_terminal_id_opener):
+        missing_terminal_id_out.append(ev)
+    assert len(missing_terminal_id_opened) == 2, missing_terminal_id_opened
+    assert missing_terminal_id_opened[1]["previous_response_id"] == "resp_created_1"
+    missing_terminal_id_terms = [
+        e for e in missing_terminal_id_out
+        if isinstance(e, dict) and e.get("type") == "response.completed"
+    ]
+    assert missing_terminal_id_terms[-1]["response"]["id"] == "resp_created_2"
+
+    # Regression: a continuation must explicitly close the previous round's
+    # async iterator before opening the next round. The real sticky WebSocket
+    # opener holds a per-upstream lock until its generator is closed; without an
+    # explicit aclose(), round 2 can deadlock behind round 1 after a 516 terminal.
+    lock = asyncio.Lock()
+    close_count = 0
+    locking_opened = []
+    locking_rounds = [
+        reasoning_round("rs_lock_1", STEP - 2, "LOCKED TRUNCATED", resp_id="resp_lock_1"),
+        reasoning_round("rs_lock_2", 123, "LOCK RELEASED", resp_id="resp_lock_2"),
+    ]
+
+    class LockingIterator:
+        def __init__(self, events):
+            self._events = iter(events)
+            self._closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._events)
+            except StopIteration:
+                await self.aclose()
+                raise StopAsyncIteration
+
+        async def aclose(self):
+            nonlocal close_count
+            if not self._closed:
+                self._closed = True
+                close_count += 1
+                lock.release()
+
+    async def locking_opener(body):
+        await asyncio.wait_for(lock.acquire(), timeout=0.5)
+        idx = len(locking_opened)
+        locking_opened.append(body)
+        return LockingIterator(locking_rounds[idx])
+
+    locking_out = []
+    async for ev in fold({"model": "gpt-5.5", "input": []}, locking_opener):
+        locking_out.append(ev)
+    assert len(locking_opened) == 2, locking_opened
+    assert close_count == 2, close_count
+    locking_deltas = [
+        e["delta"] for e in locking_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert locking_deltas == ["LOCK RELEASED"], locking_deltas
+
+    # If a truncated-id hidden continuation is rejected with
+    # previous_response_not_found, retry once as no-previous-response full replay
+    # only when the original request was already full-context.
+    fallback_opened = []
+    fallback_rounds = [
+        reasoning_round("rs_fb_1", STEP - 2, "FB TRUNCATED", resp_id="resp_fb_1"),
+        reasoning_round("rs_fb_3", 101, "FALLBACK ANSWER", resp_id="resp_fb_3"),
+    ]
+
+    async def fallback_opener(body):
+        fallback_opened.append(body)
+        idx = len(fallback_opened) - 1
+
+        async def gen():
+            if idx == 1:
+                yield {"type": "response.created", "response": {"id": "resp_fb_bad", "status": "in_progress"}}
+                raise ConnectionError("previous_response_not_found: resp_fb_1")
+            for ev in fallback_rounds[0 if idx == 0 else 1]:
+                yield ev
+        return gen()
+
+    fallback_out = []
+    async for ev in fold({"model": "gpt-5.5", "input": [{"type": "message", "role": "user"}]}, fallback_opener):
+        fallback_out.append(ev)
+    assert len(fallback_opened) == 3, fallback_opened
+    assert fallback_opened[1]["previous_response_id"] == "resp_fb_1"
+    assert [i.get("type") for i in fallback_opened[1]["input"]] == ["message"]
+    assert "previous_response_id" not in fallback_opened[2]
+    assert [i.get("type") for i in fallback_opened[2]["input"]] == ["message", "reasoning", "message"]
+    fallback_deltas = [
+        e["delta"] for e in fallback_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert fallback_deltas == ["FALLBACK ANSWER"], fallback_deltas
+
+    # The same previous_response_not_found must not silently drop context when
+    # the original client request was incremental and relied on previous_response_id.
+    incremental_opened = []
+
+    async def incremental_opener(body):
+        incremental_opened.append(body)
+        idx = len(incremental_opened) - 1
+
+        async def gen():
+            if idx == 1:
+                yield {"type": "response.created", "response": {"id": "resp_inc_bad", "status": "in_progress"}}
+                raise ConnectionError("previous_response_not_found: resp_inc_1")
+            for ev in fallback_rounds[0]:
+                yield ev
+        return gen()
+
+    incremental_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "previous_response_id": "resp_before",
+        "input": [{"type": "function_call_output"}],
+    }, incremental_opener):
+        incremental_out.append(ev)
+    assert len(incremental_opened) == 2, incremental_opened
+    inc_terms = [e for e in incremental_out if isinstance(e, dict) and e.get("type") == "response.incomplete"]
+    assert inc_terms and inc_terms[-1]["response"]["incomplete_details"]["reason"] == "upstream_error"
 
     failed_round = reasoning_round("rs_fail", STEP - 2, "FAILED", resp_id="resp_fail")
     failed_round[-1]["type"] = "response.failed"

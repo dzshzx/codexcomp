@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Summarize recent reasoning-token usage for a Codex session JSONL.
+
+Usage:
+  scripts/check-codex-session-reasoning SESSION_ID_OR_JSONL [--recent-turns N] [--last-events N]
+
+Examples:
+  scripts/check-codex-session-reasoning 019f3a0f-7899-7aa2-996c-a49d55ceaac9
+  scripts/check-codex-session-reasoning /home/abu/.codex/sessions/.../rollout-....jsonl --recent-turns 20
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+STEP = 518
+
+
+def is_bad_pattern(reasoning: int | None) -> bool:
+    return reasoning is not None and reasoning >= STEP - 2 and (reasoning + 2) % STEP == 0
+
+
+def find_session_file(value: str) -> Path:
+    p = Path(value).expanduser()
+    if p.exists():
+        return p
+    try:
+        out = subprocess.check_output(
+            ["find", str(SESSIONS_ROOT), "-type", "f", "-name", f"*{value}*.jsonl"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).splitlines()
+    except Exception as exc:
+        raise SystemExit(f"failed to search {SESSIONS_ROOT}: {exc}") from exc
+    if not out:
+        raise SystemExit(f"no session file found for: {value}")
+    if len(out) > 1:
+        print("multiple matching files; using first:", file=sys.stderr)
+        for item in out[:20]:
+            print(f"  {item}", file=sys.stderr)
+    return Path(out[0])
+
+
+def text_len_from_payload(p: dict[str, Any]) -> int:
+    if isinstance(p.get("message"), str):
+        return len(p["message"])
+    if isinstance(p.get("text"), str):
+        return len(p["text"])
+    c = p.get("content")
+    if isinstance(c, str):
+        return len(c)
+    if isinstance(c, list):
+        total = 0
+        for item in c:
+            if isinstance(item, str):
+                total += len(item)
+            elif isinstance(item, dict):
+                for key in ("text", "content", "output"):
+                    if isinstance(item.get(key), str):
+                        total += len(item[key])
+        return total
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Summarize Codex session reasoning-token usage")
+    ap.add_argument("session", help="session id substring or JSONL path")
+    ap.add_argument("--recent-turns", type=int, default=12, help="turn summaries to print")
+    ap.add_argument("--last-events", type=int, default=20, help="recent token_count events to print")
+    args = ap.parse_args()
+
+    f = find_session_file(args.session)
+    lines = f.read_text(errors="replace").splitlines()
+
+    turns: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    compact_lines: list[tuple[int, str | None, str, str | None]] = []
+
+    for line_no, line in enumerate(lines, 1):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        p = obj.get("payload")
+        ts = obj.get("timestamp")
+        top_type = obj.get("type")
+        ptype = p.get("type") if isinstance(p, dict) else None
+
+        if top_type == "compacted" or ptype == "context_compacted":
+            compact_lines.append((line_no, ts, top_type, ptype))
+
+        if isinstance(p, dict) and ptype == "task_started":
+            cur = {
+                "start_line": line_no,
+                "start_ts": ts,
+                "token_counts": [],
+                "complete": None,
+                "assistant": None,
+                "aborted": False,
+            }
+            turns.append(cur)
+
+        if cur is None:
+            continue
+
+        if isinstance(p, dict) and ptype == "token_count":
+            info = p.get("info") or {}
+            last = info.get("last_token_usage") or {}
+            cur["token_counts"].append({
+                "line": line_no,
+                "ts": ts,
+                "input": last.get("input_tokens"),
+                "cached": last.get("cached_input_tokens"),
+                "output": last.get("output_tokens"),
+                "reasoning": last.get("reasoning_output_tokens"),
+                "total": last.get("total_tokens"),
+                "model_context_window": info.get("model_context_window"),
+            })
+
+        if isinstance(p, dict) and (ptype == "agent_message" or (ptype == "message" and p.get("role") == "assistant")):
+            cur["assistant"] = {
+                "line": line_no,
+                "ts": ts,
+                "kind": ptype,
+                "len": text_len_from_payload(p),
+            }
+
+        if isinstance(p, dict) and ptype == "turn_aborted":
+            cur["aborted"] = True
+
+        if isinstance(p, dict) and ptype == "task_complete":
+            cur["complete"] = {
+                "line": line_no,
+                "ts": ts,
+                "duration_ms": p.get("duration_ms"),
+                "time_to_first_token_ms": p.get("time_to_first_token_ms"),
+            }
+
+    print(f"file={f}")
+    print(f"lines={len(lines)} size={f.stat().st_size}")
+    print(f"turns={len(turns)} compactions={len(compact_lines)}")
+    if compact_lines:
+        print("compact_lines=" + repr(compact_lines[-10:]))
+
+    print("\n--- recent turns summary ---")
+    for idx, t in list(enumerate(turns, 1))[-args.recent_turns:]:
+        token_counts = t["token_counts"]
+        last = token_counts[-1] if token_counts else None
+        max_reason = max([(x.get("reasoning") or 0) for x in token_counts], default=0)
+        bad = [(x["line"], x.get("reasoning")) for x in token_counts if is_bad_pattern(x.get("reasoning"))]
+        print({
+            "turn": idx,
+            "start_ts": t["start_ts"],
+            "complete_ts": (t["complete"] or {}).get("ts"),
+            "duration_ms": (t["complete"] or {}).get("duration_ms"),
+            "aborted": t["aborted"],
+            "token_count_events": len(token_counts),
+            "last_line": last and last["line"],
+            "last_input": last and last["input"],
+            "last_cached": last and last["cached"],
+            "last_output": last and last["output"],
+            "last_reasoning": last and last["reasoning"],
+            "last_total": last and last["total"],
+            "max_reasoning_in_turn": max_reason,
+            "516_pattern_events": bad,
+            "assistant_len": (t["assistant"] or {}).get("len"),
+        })
+
+    print("\n--- last token_count events ---")
+    all_toks: list[tuple[int, dict[str, Any]]] = []
+    for idx, t in enumerate(turns, 1):
+        for x in t["token_counts"]:
+            all_toks.append((idx, x))
+    for idx, x in all_toks[-args.last_events:]:
+        r = x.get("reasoning")
+        print(
+            f"turn={idx} line={x['line']} ts={x['ts']} "
+            f"in={x['input']} cached={x['cached']} out={x['output']} "
+            f"reasoning={r} total={x['total']} pattern={is_bad_pattern(r)}"
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

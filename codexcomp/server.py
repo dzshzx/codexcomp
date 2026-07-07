@@ -24,6 +24,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import time
 import zlib
 from typing import Any, AsyncIterator
@@ -69,6 +70,12 @@ _DROP_HEADERS = {
     "openai-beta",  # downstream transport advertisement; upstream sets its own
 }
 X_CODEX_TURN_STATE = "x-codex-turn-state"
+_ID_RE = re.compile(r"\b(resp|rs|msg|fc|call)_[A-Za-z0-9_-]{8,}\b")
+
+
+def redact_ids(text: object) -> str:
+    """Redact full upstream ids before writing to the journal."""
+    return _ID_RE.sub(lambda m: f"{m.group(1)}_{m.group(0).split('_', 1)[1][:8]}…", str(text))
 
 
 def passthrough_headers(raw: Any) -> dict[str, str]:
@@ -196,25 +203,25 @@ class UpstreamRounds:
         try:
             data = json.loads(detail)
         except json.JSONDecodeError:
-            return {"raw": detail[:500]}
+            return {"raw": redact_ids(detail)[:500]}
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
             return {
                 "type": err.get("type") or err.get("error_type"),
                 "code": err.get("code"),
-                "message": str(err.get("message", ""))[:500],
+                "message": redact_ids(err.get("message", ""))[:500],
             }
         if isinstance(data, dict):
             summary = {
                 "type": data.get("type") or data.get("error_type"),
                 "code": data.get("code"),
-                "message": str(data.get("message", ""))[:500],
+                "message": redact_ids(data.get("message", ""))[:500],
                 "keys": sorted(data.keys()),
             }
             if not any(summary.get(k) for k in ("type", "code", "message")):
-                summary["raw"] = detail[:500]
+                summary["raw"] = redact_ids(detail)[:500]
             return summary
-        return {"raw": detail[:500]}
+        return {"raw": redact_ids(detail)[:500]}
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self.aclose()
@@ -287,13 +294,13 @@ class UpstreamWsRounds:
                 "status": ev.get("status"),
                 "type": err.get("type") or err.get("error_type"),
                 "code": err.get("code"),
-                "message": str(err.get("message", ""))[:500],
+                "message": redact_ids(err.get("message", ""))[:500],
             }
         return {
             "status": ev.get("status"),
             "type": ev.get("type"),
             "code": ev.get("code"),
-            "message": str(ev.get("message", ""))[:500],
+            "message": redact_ids(ev.get("message", ""))[:500],
             "keys": sorted(ev.keys()),
         }
 
@@ -428,9 +435,9 @@ class UpstreamWsRounds:
                             await self.aclose()
                             raise RoundOpenError(
                                 int(ev.get("status") or 502),
-                                json.dumps(ev, ensure_ascii=False),
+                                redact_ids(json.dumps(ev, ensure_ascii=False)),
                             )
-                        raise ConnectionError(json.dumps(ev, ensure_ascii=False))
+                        raise ConnectionError(redact_ids(json.dumps(ev, ensure_ascii=False)))
                     if etype in TERMINAL_TYPES:
                         log.info(
                             "upstream websocket terminal: type=%s status=%s request_shape=%s",
