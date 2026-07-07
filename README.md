@@ -53,6 +53,10 @@ downstream response — Codex sees one complete, untruncated answer.
 - **Resilient SSE fallback** — the POST path transparently decompresses zstd/gzip upstream
   responses.
 - **Full `/v1/*` passthrough** — including `GET /v1/models` (model catalog refresh).
+- **Protocol-faithful headers & compaction** — upstream response headers reach Codex on the
+  POST path (`x-codex-*` rate-limit snapshots, `x-models-etag`, request ids), the
+  `x-codex-turn-state` sticky-routing token is replayed across fold rounds when the upstream
+  issues one, and remote-compaction requests are never folded.
 - **Live streaming** — reasoning streams in real time even mid-fold; only the final clean
   round's output is released downstream.
 - **Honest accounting** — the true cumulative cost of folded rounds is reported under
@@ -146,7 +150,8 @@ done: 3 round(s) | ... | status=completed stop=natural
 
 Round verdicts: `continue` (cut detected → will continue), `clean` (natural end),
 `tier_out_of_window` / `max_continue` / `no_encrypted_content` (cut detected but released
-as-is), `upstream_eof` (stream ended without a terminal event). `done:` lines end with
+as-is), `compaction_request` (remote-compaction request — never folded),
+`upstream_eof` (stream ended without a terminal event). `done:` lines end with
 `stop=natural` or the release reason. A fold torn down by a client disconnect logs
 `fold aborted downstream after N round(s)` instead of a `done:` line.
 
@@ -210,18 +215,20 @@ reads, persists, or logs a credential.
 git clone https://github.com/dzshzx/codexcomp && cd codexcomp
 uv sync
 uv run python test_fold.py        # fold state-machine self-test → ALL PASS
+uv run python test_ws.py          # transport self-test (WS protocol, headers) → ALL PASS
 uv run codexcomp                  # run locally
 ```
 
 Releases go out via PyPI Trusted Publishing (OIDC, no stored token): push a `v*` tag to build
-and publish.
+and publish. Version history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
 Bug reports, fold-log excerpts, and reproduction details are the most valuable
 contributions — please file them on
 [GitHub Issues](https://github.com/dzshzx/codexcomp/issues). For code changes, run
-`uv run python test_fold.py` before opening a PR and keep changes focused.
+`uv run python test_fold.py` and `uv run python test_ws.py` before opening a PR and keep
+changes focused.
 
 ## Community
 

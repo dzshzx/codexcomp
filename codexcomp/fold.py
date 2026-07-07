@@ -242,6 +242,15 @@ async def _fold_inner(
     """The fold state machine; `stats` mirrors round count / summed usage for
     the abort log in fold()."""
     orig_input = list(base_body.get("input") or [])
+    # A remote-compaction request (input ends with a compaction_trigger item) is
+    # a positional control frame: Codex requires the trigger to stay last and
+    # exactly one compaction output item back. Replaying it with appended
+    # reasoning would break both, so it always passes through as one round.
+    is_compaction = bool(
+        orig_input
+        and isinstance(orig_input[-1], dict)
+        and orig_input[-1].get("type") == "compaction_trigger"
+    )
     seq = 0
     ds_oi = 0
     base_response: dict[str, Any] | None = None
@@ -357,6 +366,7 @@ async def _fold_inner(
 
         do_continue = (
             terminal is not None
+            and not is_compaction
             and in_continue_window(n)
             and has_enc
             and round_no <= MAX_CONTINUE
@@ -364,7 +374,8 @@ async def _fold_inner(
         stopped_reason = None
         if not do_continue and n is not None:
             stopped_reason = (
-                "no_encrypted_content" if not has_enc
+                "compaction_request" if is_compaction
+                else "no_encrypted_content" if not has_enc
                 else "max_continue" if round_no > MAX_CONTINUE
                 else "tier_out_of_window"
             )

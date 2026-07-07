@@ -109,6 +109,48 @@ async def test_happy_fold():
     print("terminal usage:", json.dumps(u))
 
 
+async def test_compaction_passthrough():
+    """A remote-compaction request (input ends with compaction_trigger) is never
+    folded, even when its reasoning usage lands exactly on a 518n-2 boundary:
+    Codex needs the trigger to stay last and exactly one compaction item back."""
+    calls = []
+    r_item = {"id": "rs_c", "type": "reasoning", "summary": []}
+    c_item = {"id": "cmp_1", "type": "compaction", "encrypted_content": "CMP_ENC"}
+    evs = [
+        {"type": "response.created", "response": {"id": "resp_c", "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0, "item": r_item},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {**r_item, "encrypted_content": "ENC_c"}},
+        {"type": "response.output_item.added", "output_index": 1, "item": c_item},
+        {"type": "response.output_item.done", "output_index": 1, "item": c_item},
+        {"type": "response.completed", "response": {
+            "id": "resp_c", "status": "completed",
+            "usage": {"input_tokens": 100, "output_tokens": STEP - 2,
+                      "total_tokens": 98 + STEP,
+                      "output_tokens_details": {"reasoning_tokens": STEP - 2}}}},
+    ]
+
+    async def opener(body):
+        calls.append(body)
+
+        async def gen():
+            for ev in evs:
+                yield ev
+        return gen()
+
+    out = [ev async for ev in fold(
+        {"model": "gpt-5.5", "stream": True,
+         "input": [{"type": "message", "role": "user"}, {"type": "compaction_trigger"}]},
+        opener)]
+    assert len(calls) == 1, f"compaction request must stay single-round, opened {len(calls)}"
+    assert calls[0]["input"][-1] == {"type": "compaction_trigger"}
+    term = out[-1]
+    assert term["type"] == "response.completed", term
+    resp = term["response"]
+    assert [i["type"] for i in resp["output"]] == ["reasoning", "compaction"], resp["output"]
+    assert resp["metadata"]["proxy_stopped_reason"] == "compaction_request"
+
+
 async def test_round1_rejected():
     """Upstream rejects round 1: fold itself yields the response.failed terminal."""
     async def opener(body):
@@ -175,6 +217,7 @@ async def test_upstream_eof():
 
 async def main():
     await test_happy_fold()
+    await test_compaction_passthrough()
     await test_round1_rejected()
     await test_continuation_open_fails()
     await test_upstream_eof()

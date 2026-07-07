@@ -19,6 +19,7 @@ USER1 = {"type": "message", "role": "user",
 FCO = {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
 
 upstream_calls: list[dict] = []
+upstream_request_headers: list[httpx.Headers] = []
 
 
 def canned_sse(rid: str) -> bytes:
@@ -37,14 +38,41 @@ def canned_sse(rid: str) -> bytes:
     return out + b"data: [DONE]\n\n"
 
 
+def truncated_sse(rid: str) -> bytes:
+    """One round cut exactly at the 518n-2 fingerprint, reasoning only."""
+    r_item = {"id": f"rs_{rid}", "type": "reasoning", "summary": []}
+    events = [
+        {"type": "response.created", "response": {"id": rid, "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 0, "item": r_item},
+        {"type": "response.output_item.done", "output_index": 0,
+         "item": {**r_item, "encrypted_content": "ENC_" + rid}},
+        {"type": "response.completed", "response": {
+            "id": rid, "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 516, "total_tokens": 526,
+                      "output_tokens_details": {"reasoning_tokens": 516}}}},
+    ]
+    out = b"".join(f"data: {json.dumps(ev)}\n\n".encode() for ev in events)
+    return out + b"data: [DONE]\n\n"
+
+
 def mock_upstream(request: httpx.Request) -> httpx.Response:
     body = json.loads(request.content)
     upstream_calls.append(body)
+    upstream_request_headers.append(request.headers)
     if body.get("model") == "fail-me":
         return httpx.Response(400, json={"detail": "boom"})
     rid = f"resp_up_{len(upstream_calls)}"
-    return httpx.Response(200, content=canned_sse(rid),
-                          headers={"content-type": "text/event-stream"})
+    headers = {"content-type": "text/event-stream",
+               "x-reasoning-included": "true",
+               "x-codex-turn-state": f"TS_{len(upstream_calls)}",
+               "x-request-id": f"req_{len(upstream_calls)}"}
+    content = canned_sse(rid)
+    if body.get("model") == "truncate-once":
+        is_continuation = any(isinstance(i, dict) and i.get("type") == "reasoning"
+                              for i in body.get("input") or [])
+        if not is_continuation:
+            content = truncated_sse(rid)
+    return httpx.Response(200, content=content, headers=headers)
 
 
 def make_client() -> TestClient:
@@ -149,14 +177,63 @@ def test_post_sse_unchanged():
     assert upstream_calls[n_before]["input"] == [USER1]
 
 
+def test_post_header_propagation():
+    """Upstream round-1 response headers are mirrored onto the downstream POST
+    response — Codex reads x-reasoning-included (token-accounting mode),
+    x-codex-turn-state (sticky routing) and x-request-id from them."""
+    client = make_client()
+    resp = client.post("/v1/responses",
+                       json={"model": "gpt-5.5", "stream": True, "input": [USER1]})
+    assert resp.status_code == 200
+    assert resp.headers["x-reasoning-included"] == "true"
+    assert resp.headers["x-codex-turn-state"] == "TS_1"
+    assert resp.headers["x-request-id"] == "req_1"
+    assert resp.headers["content-type"].startswith("text/event-stream")
+
+
+def test_turn_state_replayed_on_continuation():
+    """The sticky-routing token minted by round 1's response is sent back as a
+    request header on the fold's continuation round; downstream still sees
+    round 1's headers."""
+    client = make_client()
+    resp = client.post("/v1/responses",
+                       json={"model": "truncate-once", "stream": True, "input": [USER1]})
+    assert resp.status_code == 200
+    assert "response.completed" in resp.text
+    assert len(upstream_calls) == 2, [b.get("model") for b in upstream_calls]
+    h1, h2 = upstream_request_headers
+    assert "x-codex-turn-state" not in h1
+    assert h2["x-codex-turn-state"] == "TS_1"
+    assert resp.headers["x-codex-turn-state"] == "TS_1"
+
+
+def test_ws_handshake_stays_bare():
+    """Codex reads server_reasoning_included ONLY from the 101 upgrade response
+    (presence-based). The real backend's handshake does not carry it
+    (live-probed 2026-07-07), so ours must not either — declaring a flag the
+    upstream doesn't would skew Codex's context accounting vs a direct
+    connection."""
+    client = make_client()
+    with client.websocket_connect("/v1/responses") as ws:
+        names = {k.lower() for k, _ in (ws.extra_headers or [])}
+        assert b"x-reasoning-included" not in names, ws.extra_headers
+
+
+def clear_state():
+    upstream_calls.clear()
+    upstream_request_headers.clear()
+
+
 def main():
-    test_prewarm_then_incremental()
-    upstream_calls.clear()
-    test_unknown_previous_response()
-    upstream_calls.clear()
-    test_failed_turn_invalidates_state()
-    upstream_calls.clear()
-    test_post_sse_unchanged()
+    for test in (test_prewarm_then_incremental,
+                 test_unknown_previous_response,
+                 test_failed_turn_invalidates_state,
+                 test_post_sse_unchanged,
+                 test_post_header_propagation,
+                 test_turn_state_replayed_on_continuation,
+                 test_ws_handshake_stays_bare):
+        clear_state()
+        test()
     print("ws transport self-test: ALL PASS")
 
 

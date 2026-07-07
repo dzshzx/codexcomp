@@ -62,8 +62,8 @@ TRUNCATION_VERDICTS = {"continue", "tier_out_of_window", "max_continue",
                        "no_encrypted_content"}
 ORPHAN_FOLD_GRACE_S = 15  # wait after a failed `on` run for its fold to finish
 FOLD_ROUND_RE = re.compile(
-    # cached= may be absent (>=0.4.0 omits it when unknown) or literally
-    # `cached=None` (0.3.x printed the raw value) — both must not break the match
+    # cached= may be absent (>=0.3.4 omits it when unknown) or literally
+    # `cached=None` (<=0.3.3 printed the raw value) — both must not break the match
     r"round (\d+): in=(\d+) (?:cached=(\d+|None) )?out=(\d+) reason=(\d+) total=(\d+) \| "
     r"n=(None|\d+) buffered=(\[.*?\]) -> (\w+)"
 )

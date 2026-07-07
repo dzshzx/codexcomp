@@ -107,22 +107,35 @@ def parse_sse(text_chunks: AsyncIterator[str]) -> AsyncIterator[dict | object]:
 
 class UpstreamRounds:
     """RoundOpener bound to one downstream request's headers; closes the
-    previous round's response before opening the next."""
+    previous round's response before opening the next.
+
+    Round 1's response headers are kept for the downstream transport (Codex
+    reads x-reasoning-included / x-codex-turn-state / rate-limit snapshots from
+    them), and the x-codex-turn-state sticky-routing token is captured once and
+    replayed on every continuation round — mirroring Codex's own per-turn
+    OnceLock — unless the downstream request already pinned one."""
 
     def __init__(self, client: httpx.AsyncClient, responses_url: str,
                  headers: dict[str, str]):
         self.client = client
         self.responses_url = responses_url
         self.headers = headers
+        self.first_response_headers: httpx.Headers | None = None
+        self._turn_state: str | None = None
+        self._client_pinned_turn_state = any(
+            k.lower() == "x-codex-turn-state" for k in headers)
         self._resp: httpx.Response | None = None
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self.aclose()
+        headers = {**self.headers, "content-type": "application/json",
+                   "accept": "text/event-stream"}
+        if self._turn_state is not None and not self._client_pinned_turn_state:
+            headers["x-codex-turn-state"] = self._turn_state
         req = self.client.build_request(
             "POST", self.responses_url,
             content=json.dumps(body, ensure_ascii=False).encode(),
-            headers={**self.headers, "content-type": "application/json",
-                     "accept": "text/event-stream"},
+            headers=headers,
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
         resp = await self.client.send(req, stream=True)
@@ -130,6 +143,14 @@ class UpstreamRounds:
             detail = (await resp.aread()).decode(errors="replace")
             await resp.aclose()
             raise RoundOpenError(resp.status_code, detail)
+        if self.first_response_headers is None:
+            self.first_response_headers = resp.headers
+        if self._turn_state is None:
+            self._turn_state = resp.headers.get("x-codex-turn-state")
+        log.info("round open: reasoning_included=%s turn_state=%s request_id=%s",
+                 resp.headers.get("x-reasoning-included"),
+                 "present" if resp.headers.get("x-codex-turn-state") else "absent",
+                 resp.headers.get("x-request-id") or resp.headers.get("x-oai-request-id"))
         self._resp = resp
         return parse_sse(resp.aiter_text())
 
@@ -237,11 +258,15 @@ def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, A
 # --- downstream endpoints -----------------------------------------------------
 
 
-async def drive_fold(state: Any, headers: dict[str, str],
+def make_rounds(state: Any, headers: dict[str, str]) -> UpstreamRounds:
+    return UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+
+
+async def drive_fold(rounds: UpstreamRounds,
                      body: dict[str, Any]) -> AsyncIterator[dict | object]:
     """One folded request: owns the UpstreamRounds lifecycle and yields
-    downstream events. Transports only serialize what comes out of here."""
-    rounds = UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    downstream events. Transports only serialize what comes out of here (and
+    may read rounds.first_response_headers once events start flowing)."""
     gen = fold(body, rounds.open)
     try:
         async for ev in gen:
@@ -264,6 +289,23 @@ def sse_bytes(ev: dict | object) -> bytes:
     return f"event: {etype}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n".encode()
 
 
+# upstream response headers never mirrored downstream: hop-by-hop / envelope
+# headers the downstream response owns itself. Everything else passes through —
+# Codex reads x-reasoning-included (token-accounting mode), x-codex-turn-state
+# (sticky routing), x-request-id, openai-model and the rate-limit snapshot
+# headers from the POST response.
+_DOWNSTREAM_DROP = {
+    "content-type", "content-length", "content-encoding", "transfer-encoding",
+    "connection", "date", "server",
+}
+
+
+def downstream_headers(upstream: httpx.Headers | None) -> dict[str, str]:
+    if upstream is None:
+        return {}
+    return {k: v for k, v in upstream.items() if k.lower() not in _DOWNSTREAM_DROP}
+
+
 async def responses_post(request: Request) -> Response:
     raw = await request.body()
     try:
@@ -272,11 +314,20 @@ async def responses_post(request: Request) -> Response:
     except (ValueError, json.JSONDecodeError) as exc:
         return JSONResponse({"error": f"bad request body: {exc}"}, status_code=400)
 
-    events = drive_fold(request.app.state, upstream_headers(request.headers.raw), body)
+    rounds = make_rounds(request.app.state, upstream_headers(request.headers.raw))
+    events = drive_fold(rounds, body)
+    # Pull the first event before answering: it forces round 1 open, so the
+    # upstream response headers exist and can be mirrored onto our response.
+    try:
+        first = await events.__anext__()
+    except BaseException:
+        await events.aclose()
+        raise
 
     async def stream() -> AsyncIterator[bytes]:
         sent_done = False
         try:
+            yield sse_bytes(first)
             async for ev in events:
                 if ev is DONE:
                     sent_done = True
@@ -292,10 +343,17 @@ async def responses_post(request: Request) -> Response:
             # hang until connection close.
             yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers=downstream_headers(rounds.first_response_headers))
 
 
 async def responses_ws(ws: WebSocket) -> None:
+    # Codex reads connection-wide flags (x-reasoning-included token-accounting
+    # mode, x-models-etag) from the 101 upgrade response, presence-based. The
+    # real backend's handshake carries NEITHER for this endpoint (live-probed
+    # 2026-07-07: only x-models-etag, no x-reasoning-included), so the accept
+    # stays bare — adding flags the upstream doesn't declare would skew Codex's
+    # context accounting relative to a direct connection.
     await ws.accept()
     headers = upstream_headers(ws.headers.raw)
     sess = WsSession()
@@ -323,7 +381,7 @@ async def responses_ws(ws: WebSocket) -> None:
                 await ws.send_text(json.dumps(sess.prewarm_ack(body), ensure_ascii=False))
                 continue
             sess.note_request(body)
-            events = drive_fold(ws.app.state, headers, body)
+            events = drive_fold(make_rounds(ws.app.state, headers), body)
             try:
                 async for ev in events:
                     if ev is DONE:
