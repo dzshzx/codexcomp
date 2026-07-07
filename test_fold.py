@@ -3,6 +3,7 @@
 Run: uv run python test_fold.py
 """
 import asyncio
+import contextlib
 import json
 from types import SimpleNamespace
 
@@ -215,6 +216,37 @@ async def main():
     ]
     assert missing_terminal_id_terms[-1]["response"]["id"] == "resp_created_2"
 
+    # Preserve upstream turn-state metadata on proxy-owned hidden continuations.
+    # Codex's own client replays this per-turn value for subsequent requests;
+    # the proxy must do the same for continuations it opens without Codex seeing
+    # the intermediate upstream response first.
+    turn_state_opened = []
+    turn_state_rounds = [
+        reasoning_round("rs_turn_state_1", STEP - 2, "TRUNCATED", resp_id="resp_turn_state_1"),
+        reasoning_round("rs_turn_state_2", 123, "CLEAN", resp_id="resp_turn_state_2"),
+    ]
+    turn_state_rounds[0].insert(
+        -1,
+        {"type": "response.metadata", "headers": {"x-codex-turn-state": "turn_state_secret"}},
+    )
+
+    async def turn_state_opener(body):
+        turn_state_opened.append(body)
+        idx = len(turn_state_opened) - 1
+
+        async def gen():
+            for ev in turn_state_rounds[idx]:
+                yield ev
+        return gen()
+
+    async for _ in fold({
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user"}],
+    }, turn_state_opener):
+        pass
+    assert len(turn_state_opened) == 2, turn_state_opened
+    assert turn_state_opened[1]["client_metadata"]["x-codex-turn-state"] == "turn_state_secret"
+
     # Regression: a continuation must explicitly close the previous round's
     # async iterator before opening the next round. The real sticky WebSocket
     # opener holds a per-upstream lock until its generator is closed; without an
@@ -301,6 +333,72 @@ async def main():
     ]
     assert fallback_deltas == ["FALLBACK ANSWER"], fallback_deltas
 
+    # The same fallback must also work when the hidden continuation fails before
+    # any response event is yielded. WebSocket first-frame errors surface as
+    # RoundOpenError from the event iterator; POST rejects previous_response_id
+    # directly from open().
+    first_frame_error_opened = []
+
+    async def first_frame_error_opener(body):
+        first_frame_error_opened.append(body)
+        idx = len(first_frame_error_opened) - 1
+
+        async def gen():
+            if idx == 1:
+                raise RoundOpenError(
+                    400,
+                    json.dumps({"error": {"code": "previous_response_not_found"}}),
+                )
+            for ev in fallback_rounds[0 if idx == 0 else 1]:
+                yield ev
+        return gen()
+
+    first_frame_error_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user"}],
+    }, first_frame_error_opener):
+        first_frame_error_out.append(ev)
+    assert len(first_frame_error_opened) == 3, first_frame_error_opened
+    assert first_frame_error_opened[1]["previous_response_id"] == "resp_fb_1"
+    assert "previous_response_id" not in first_frame_error_opened[2]
+    first_frame_deltas = [
+        e["delta"] for e in first_frame_error_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert first_frame_deltas == ["FALLBACK ANSWER"], first_frame_deltas
+
+    post_reject_opened = []
+
+    async def post_reject_opener(body):
+        post_reject_opened.append(body)
+        idx = len(post_reject_opened) - 1
+        if idx == 1:
+            raise RoundOpenError(
+                400,
+                json.dumps({"detail": "Unsupported parameter: previous_response_id"}),
+            )
+
+        async def gen():
+            for ev in fallback_rounds[0 if idx == 0 else 1]:
+                yield ev
+        return gen()
+
+    post_reject_out = []
+    async for ev in fold({
+        "model": "gpt-5.5",
+        "input": [{"type": "message", "role": "user"}],
+    }, post_reject_opener):
+        post_reject_out.append(ev)
+    assert len(post_reject_opened) == 3, post_reject_opened
+    assert post_reject_opened[1]["previous_response_id"] == "resp_fb_1"
+    assert "previous_response_id" not in post_reject_opened[2]
+    post_reject_deltas = [
+        e["delta"] for e in post_reject_out
+        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
+    ]
+    assert post_reject_deltas == ["FALLBACK ANSWER"], post_reject_deltas
+
     # The same previous_response_not_found must not silently drop context when
     # the original client request was incremental and relied on previous_response_id.
     incremental_opened = []
@@ -328,21 +426,16 @@ async def main():
     inc_terms = [e for e in incremental_out if isinstance(e, dict) and e.get("type") == "response.incomplete"]
     assert inc_terms and inc_terms[-1]["response"]["incomplete_details"]["reason"] == "upstream_error"
 
-    # High-effort gpt-5.5 zero-reasoning rounds are suspicious too: retry them
-    # through the same bounded fold path, while still using the safe current
-    # response id + nudge-only continuation strategy.
+    # Zero-reasoning retry is disabled: high-effort gpt-5.5 can legitimately
+    # return reasoning_tokens == 0 with a good, complete direct answer. Preserve
+    # the first answer rather than hiding it behind continuation rounds.
     zero_opened = []
-    zero_rounds = [
-        message_round("zero", 0, "ZERO ANSWER", resp_id="resp_zero_1"),
-        message_round("clean", 123, "REAL ANSWER", resp_id="resp_zero_2"),
-    ]
 
     async def zero_opener(body):
         zero_opened.append(body)
-        idx = len(zero_opened) - 1
 
         async def gen():
-            for ev in zero_rounds[idx]:
+            for ev in message_round("zero", 0, "ZERO ANSWER", resp_id="resp_zero_1"):
                 yield ev
         return gen()
 
@@ -354,81 +447,30 @@ async def main():
         "input": [{"type": "message", "role": "user"}],
     }, zero_opener):
         zero_out.append(ev)
-    assert len(zero_opened) == 2, zero_opened
-    assert zero_opened[1]["previous_response_id"] == "resp_zero_1"
-    assert [i.get("type") for i in zero_opened[1]["input"]] == ["message"]
+    assert len(zero_opened) == 1, zero_opened
     zero_deltas = [
         e["delta"] for e in zero_out
         if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
     ]
-    assert zero_deltas == ["REAL ANSWER"], zero_deltas
+    assert zero_deltas == ["ZERO ANSWER"], zero_deltas
     zero_terms = [
         e for e in zero_out
         if isinstance(e, dict) and e.get("type") == "response.completed"
     ]
-    assert [r["zero_reasoning_retry"] for r in zero_terms[-1]["response"]["metadata"]["proxy_rounds"]] == [True, False]
+    assert [r["zero_reasoning_retry"] for r in zero_terms[-1]["response"]["metadata"]["proxy_rounds"]] == [False]
 
-    # The zero-reasoning retry is narrow: not medium effort, not other models.
+    # Effort normalization remains available for diagnostics, but zero-retry is
+    # currently off for all models/efforts.
     assert requested_effort({"reasoning": {"effort": "extra high"}}) == "extra_high"
     assert requested_effort({"reasoning": {"effort": "x-high"}}) == "x_high"
-    assert should_retry_zero_reasoning({
+    assert not should_retry_zero_reasoning({
         "model": "gpt-5.5-2026-07-06",
         "reasoning": {"effort": "extra-high"},
     }, 0)
     assert not should_retry_zero_reasoning({"model": "gpt-5.5", "reasoning": {"effort": "medium"}}, 0)
     assert not should_retry_zero_reasoning({"model": "gpt-5.4", "reasoning": {"effort": "high"}}, 0)
 
-    medium_opened = []
-
-    async def medium_opener(body):
-        medium_opened.append(body)
-
-        async def gen():
-            for ev in [*message_round("medium", 0, "ZERO MEDIUM", resp_id="resp_medium")]:
-                yield ev
-        return gen()
-
-    medium_out = []
-    async for ev in fold({
-        "model": "gpt-5.5",
-        "reasoning": {"effort": "medium"},
-        "input": [{"type": "message", "role": "user"}],
-    }, medium_opener):
-        medium_out.append(ev)
-    assert len(medium_opened) == 1, medium_opened
-    medium_deltas = [
-        e["delta"] for e in medium_out
-        if isinstance(e, dict) and e.get("type") == "response.output_text.delta"
-    ]
-    assert medium_deltas == ["ZERO MEDIUM"], medium_deltas
-
-    # Empty-output/prewarm-style zero-reasoning rounds are not retried.
-    empty_opened = []
-
-    async def empty_opener(body):
-        empty_opened.append(body)
-
-        async def gen():
-            yield {"type": "response.created", "response": {"id": "resp_empty", "status": "in_progress"}}
-            yield {"type": "response.completed", "response": {
-                "id": "resp_empty", "status": "completed",
-                "usage": {"input_tokens": 10, "output_tokens": 0, "total_tokens": 10,
-                          "output_tokens_details": {"reasoning_tokens": 0}},
-            }}
-        return gen()
-
-    empty_out = []
-    async for ev in fold({
-        "model": "gpt-5.5",
-        "reasoning": {"effort": "high"},
-        "input": [],
-        "generate": True,
-    }, empty_opener):
-        empty_out.append(ev)
-    assert len(empty_opened) == 1, empty_opened
-
-    # Zero-reasoning function-call rounds are not retried: a retry would create
-    # an unresolved tool call with no matching function_call_output.
+    # Zero-reasoning function-call rounds are also passed through normally.
     call_opened = []
 
     async def call_opener(body):
@@ -453,43 +495,6 @@ async def main():
         if isinstance(e, dict) and e.get("type") == "response.completed"
     ]
     assert call_terms[-1]["response"]["metadata"]["proxy_rounds"][-1]["zero_reasoning_retry"] is False
-
-    # Repeated zero-reasoning rounds respect MAX_CONTINUE and then flush the
-    # final bounded attempt with metadata explaining the stop reason.
-    repeated_opened = []
-    repeated_rounds = [
-        message_round("zero1", 0, "ZERO 1", resp_id="resp_z1"),
-        message_round("zero2", 0, "ZERO 2", resp_id="resp_z2"),
-        message_round("zero3", 0, "ZERO 3", resp_id="resp_z3"),
-        message_round("zero4", 0, "ZERO 4", resp_id="resp_z4"),
-    ]
-
-    async def repeated_opener(body):
-        repeated_opened.append(body)
-        idx = len(repeated_opened) - 1
-
-        async def gen():
-            for ev in repeated_rounds[idx]:
-                yield ev
-        return gen()
-
-    repeated_out = []
-    async for ev in fold({
-        "model": "gpt-5.5",
-        "reasoning": {"effort": "high"},
-        "previous_response_id": "resp_zprev",
-        "input": [{"type": "message", "role": "user"}],
-    }, repeated_opener):
-        repeated_out.append(ev)
-    assert len(repeated_opened) == 4, repeated_opened
-    repeated_terms = [
-        e for e in repeated_out
-        if isinstance(e, dict) and e.get("type") == "response.completed"
-    ]
-    repeated_term = repeated_terms[-1]["response"]
-    assert repeated_term["metadata"]["proxy_stopped_reason"] == "zero_reasoning_max_continue"
-    assert [r["zero_reasoning_retry"] for r in repeated_term["metadata"]["proxy_rounds"]] == [
-        True, True, True, True]
 
     failed_round = reasoning_round("rs_fail", STEP - 2, "FAILED", resp_id="resp_fail")
     failed_round[-1]["type"] = "response.failed"
@@ -938,6 +943,50 @@ async def main():
         server.RESPONSES_WS_READ_TIMEOUT = old_timeout
     assert hanging_out[-1]["response"]["status"] == "incomplete"
     assert not hanging_rounds.is_busy()
+
+    # Cancelling while open() is still connecting/sending must release the
+    # upstream round lock; otherwise every later pooled turn deadlocks.
+    cancel_connect_rounds = server.UpstreamWsRounds(server.upstream_ws_headers([]))
+    connect_started = asyncio.Event()
+
+    async def hanging_connect():
+        connect_started.set()
+        await never.wait()
+
+    cancel_connect_rounds._connect = hanging_connect
+    cancel_open_task = asyncio.create_task(cancel_connect_rounds.open({
+        "model": "gpt-5.5",
+        "input": [],
+    }))
+    await asyncio.wait_for(connect_started.wait(), timeout=1)
+    assert cancel_connect_rounds.is_busy()
+    cancel_open_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_open_task
+    assert not cancel_connect_rounds.is_busy()
+
+    cancel_send_rounds = server.UpstreamWsRounds(server.upstream_ws_headers([]))
+    send_started = asyncio.Event()
+
+    class HangingSendWs:
+        async def send(self, msg):
+            send_started.set()
+            await never.wait()
+
+    async def connected_ws():
+        return HangingSendWs()
+
+    cancel_send_rounds._connect = connected_ws
+    cancel_send_task = asyncio.create_task(cancel_send_rounds.open({
+        "model": "gpt-5.5",
+        "input": [],
+    }))
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+    assert cancel_send_rounds.is_busy()
+    cancel_send_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_send_task
+    assert not cancel_send_rounds.is_busy()
 
     # Pool cleanup should evict idle stale entries.
     class StalePoolItem:

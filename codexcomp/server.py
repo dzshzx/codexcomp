@@ -361,7 +361,7 @@ class UpstreamWsRounds:
         self._owner_task = asyncio.current_task()
         try:
             ws = await self._connect()
-        except Exception:
+        except BaseException:
             self._owner_task = None
             self._lock.release()
             raise
@@ -374,7 +374,7 @@ class UpstreamWsRounds:
         )
         try:
             await ws.send(json.dumps(payload, ensure_ascii=False))
-        except Exception:
+        except BaseException:
             self._owner_task = None
             self._lock.release()
             raise

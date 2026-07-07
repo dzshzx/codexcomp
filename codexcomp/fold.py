@@ -13,8 +13,11 @@ Mechanism credit: neteroster/CodexCont (MIT). Implementation is original.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import re
+import secrets
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
@@ -27,8 +30,9 @@ MAX_N = 6          # stop forcing once n > MAX_N (0 = no cap)
 MAX_CONTINUE = 3   # continuation rounds after round 1 (runaway guard)
 MARKER_TEXT = "Continue thinking..."
 ENC_INCLUDE = "reasoning.encrypted_content"
-ZERO_RETRY_MODELS = {"gpt-5.5"}
-ZERO_RETRY_EFFORTS = {"high", "xhigh", "x_high", "extra_high", "extrahigh"}
+ZERO_RETRY_MODELS: set[str] = set()
+ZERO_RETRY_EFFORTS: set[str] = set()
+X_CODEX_TURN_STATE = "x-codex-turn-state"
 
 TERMINAL_TYPES = ("response.completed", "response.failed", "response.incomplete")
 
@@ -37,11 +41,72 @@ RoundOpener = Callable[[dict[str, Any]], Awaitable[AsyncIterator[dict[str, Any]]
 
 
 _ID_RE = re.compile(r"\b(resp|rs|msg|fc|call)_[A-Za-z0-9_-]{8,}\b")
+_LOG_HASH_KEY = secrets.token_bytes(16)
 
 
 def redact_ids(text: object) -> str:
     """Redact full upstream ids before logging/presenting proxy errors."""
     return _ID_RE.sub(lambda m: f"{m.group(1)}_{m.group(0).split('_', 1)[1][:8]}…", str(text))
+
+
+def _content_sig(text: str) -> str | None:
+    """Process-local digest for comparing hidden outputs without logging text.
+
+    The key is generated on process start, so the digest is useful for comparing
+    nearby rounds in one service run but is not stable across restarts/log files.
+    """
+    if not text:
+        return None
+    h = hashlib.blake2s(key=_LOG_HASH_KEY, digest_size=8)
+    h.update(text.encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+
+def _message_text_for_log(item: dict[str, Any]) -> str:
+    fragments: list[str] = []
+    content = item.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("output_text", "input_text") and isinstance(part.get("text"), str):
+                fragments.append(part["text"])
+    elif isinstance(content, str):
+        fragments.append(content)
+    return "".join(fragments)
+
+
+def _debug_text_enabled() -> bool:
+    return str(os.getenv("CODEXCOMP_DEBUG_TEXT") or "").strip().lower() in {
+        "1", "true", "yes", "on", "full",
+    }
+
+
+def _buffered_log_summary(buffered: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    """Summarize buffered output.
+
+    By default this avoids prompt/answer text and logs only type, character
+    counts, and process-local hashes. If CODEXCOMP_DEBUG_TEXT=1 is explicitly
+    set, include full buffered assistant message text for diagnosing hidden
+    continuation rounds. Request headers/auth are still never logged here.
+    """
+    summary: list[dict[str, Any]] = []
+    sig_parts: list[str] = []
+    for entry in buffered:
+        item = entry.get("item") or {}
+        typ = item.get("type")
+        row: dict[str, Any] = {"type": typ}
+        if typ == "message":
+            text = _message_text_for_log(item)
+            sig = _content_sig(text)
+            row["chars"] = len(text)
+            row["sig"] = sig
+            if _debug_text_enabled():
+                row["text"] = redact_ids(text)
+            if sig is not None:
+                sig_parts.append(sig)
+        summary.append(row)
+    return summary, "+".join(sig_parts) or None
 
 
 class RoundOpenError(Exception):
@@ -99,16 +164,14 @@ def requested_effort(body: dict[str, Any]) -> str:
 
 
 def should_retry_zero_reasoning(body: dict[str, Any], tokens: int | None) -> bool:
-    """Retry zero-reasoning answers only for high-effort gpt-5.5.
+    """Zero-reasoning retry is intentionally disabled.
 
-    Zero reasoning can be legitimate for tiny direct answers, so this is much
-    narrower than the 518n-2 fingerprint detector.
+    Live Codex CLI testing showed high-effort gpt-5.5 can return
+    reasoning_tokens == 0 with a good, complete direct answer. Retrying those
+    rounds hides the good answer and often degrades subsequent attempts. Keep
+    continuation automatic only for the stronger 518n-2 truncation fingerprint.
     """
-    model = str(body.get("model") or "").lower()
-    is_model = model in ZERO_RETRY_MODELS or any(
-        model.startswith(f"{known}-") for known in ZERO_RETRY_MODELS
-    )
-    return tokens == 0 and is_model and requested_effort(body) in ZERO_RETRY_EFFORTS
+    return False
 
 
 # --- continuation payload ----------------------------------------------------
@@ -268,6 +331,8 @@ async def fold(
     saw_done = False
     final_output: list[dict[str, Any]] = []
     reasoning_replay: list[Any] = []
+    last_turn_state: str | None = None
+    last_hidden_output_sig: str | None = None
     summed_usage: dict[str, Any] = {}
     first_usage: dict[str, Any] | None = None
     rounds_info: list[dict[str, Any]] = []
@@ -278,6 +343,74 @@ async def fold(
         ev["sequence_number"] = seq
         seq += 1
         return ev
+
+    def add_turn_state(body: dict[str, Any]) -> None:
+        if not last_turn_state:
+            return
+        client_metadata = body.get("client_metadata")
+        if not isinstance(client_metadata, dict):
+            client_metadata = {}
+        else:
+            client_metadata = dict(client_metadata)
+        client_metadata.setdefault(X_CODEX_TURN_STATE, last_turn_state)
+        body["client_metadata"] = client_metadata
+
+    def can_try_continuation_fallback(failed_round_no: int, exc: BaseException) -> bool:
+        detail = getattr(exc, "detail", "")
+        text = f"{detail} {exc}"
+        low = text.lower()
+        return (
+            failed_round_no > 1
+            and not continuation_fallback_used
+            and not base_body.get("previous_response_id")
+            and (
+                "previous_response_not_found" in low
+                or ("previous_response_id" in low and "unsupported" in low)
+            )
+        )
+
+    async def open_continuation_fallback(
+        failed_round_no: int,
+        fallback_round_no: int,
+        exc: BaseException,
+    ) -> AsyncIterator[dict[str, Any]] | None:
+        nonlocal continuation_fallback_used
+        # If the primary hidden continuation failed because the truncated
+        # response id was not available/supported upstream, retry once with a
+        # full no-previous-response replay only when the client request itself
+        # was already full-context. For incremental Codex turns, silently
+        # dropping previous_response_id would lose context; return incomplete and
+        # let Codex perform its own full replay.
+        if not can_try_continuation_fallback(failed_round_no, exc):
+            return None
+        continuation_fallback_used = True
+        try:
+            fallback_body = next_round_body(
+                base_body,
+                orig_input + reasoning_replay + [commentary_nudge()],
+            )
+            fallback_body.pop("previous_response_id", None)
+            add_turn_state(fallback_body)
+            log.info(
+                "open continuation fallback round %d: previous_response_id=no input_items=%d replay_items=%d",
+                fallback_round_no,
+                len(fallback_body.get("input") or []),
+                len(reasoning_replay),
+            )
+            return await open_round(fallback_body)
+        except RoundOpenError as fallback_exc:
+            log.warning(
+                "continuation fallback round %d failed to open: %s",
+                fallback_round_no,
+                fallback_exc,
+            )
+        except Exception as fallback_exc:
+            log.warning(
+                "continuation fallback round %d failed to open: %s",
+                fallback_round_no,
+                redact_ids(repr(fallback_exc)),
+            )
+        return None
 
     round_no = 0
     round1_body = next_round_body(base_body, orig_input)
@@ -319,6 +452,12 @@ async def fold(
                     usage = (ev.get("response") or {}).get("usage")
                     break
 
+                if etype == "response.metadata":
+                    headers = ev.get("headers")
+                    turn_state = headers.get(X_CODEX_TURN_STATE) if isinstance(headers, dict) else None
+                    if isinstance(turn_state, str) and turn_state:
+                        last_turn_state = turn_state
+
                 oi = ev.get("output_index")
                 if etype == "response.output_item.added":
                     item = ev.get("item") or {}
@@ -349,45 +488,27 @@ async def fold(
                         entry["item"] = ev.get("item") or entry["item"]
                 else:
                     yield stamp(ev)  # unknown scope: forward best-effort
-        except RoundOpenError:
-            raise  # only raised before any event; handled by caller for round 1
+        except RoundOpenError as exc:
+            fallback_events = await open_continuation_fallback(round_no, round_no + 1, exc)
+            if fallback_events is not None:
+                events = fallback_events
+                continue
+            if round_no == 1:
+                raise  # round 1 rejected: handled by transport caller
+            log.warning("round %d: upstream error before response events: %s", round_no, exc)
+            _sum_usage(summed_usage, usage)
+            yield stamp(_terminal_event(
+                None, round_response or base_response, final_output,
+                agent_usage(first_usage, summed_usage, usage, flushed_final=False),
+                rounds_info, summed_usage, "upstream_error",
+                incomplete_reason="upstream_error"))
+            return
         except (httpx.HTTPError, ConnectionError, TimeoutError, OSError) as exc:
             log.warning("round %d: upstream error mid-stream: %s", round_no, redact_ids(repr(exc)))
-            # If the primary hidden continuation failed because the truncated
-            # response id was not available upstream, retry once with a full
-            # no-previous-response replay only when the client request itself was
-            # already full-context. For incremental Codex turns, silently dropping
-            # previous_response_id would lose context; return incomplete and let
-            # Codex perform its own full replay.
-            if (
-                round_no > 1
-                and not continuation_fallback_used
-                and not base_body.get("previous_response_id")
-                and "previous_response_not_found" in str(exc)
-            ):
-                continuation_fallback_used = True
-                try:
-                    fallback_body = next_round_body(
-                        base_body,
-                        orig_input + reasoning_replay + [commentary_nudge()],
-                    )
-                    fallback_body.pop("previous_response_id", None)
-                    log.info(
-                        "open continuation fallback round %d: previous_response_id=no input_items=%d replay_items=%d",
-                        round_no + 1,
-                        len(fallback_body.get("input") or []),
-                        len(reasoning_replay),
-                    )
-                    events = await open_round(fallback_body)
-                    continue
-                except RoundOpenError as fallback_exc:
-                    log.warning("continuation fallback round %d failed to open: %s", round_no + 1, fallback_exc)
-                except Exception as fallback_exc:
-                    log.warning(
-                        "continuation fallback round %d failed to open: %s",
-                        round_no + 1,
-                        redact_ids(repr(fallback_exc)),
-                    )
+            fallback_events = await open_continuation_fallback(round_no, round_no + 1, exc)
+            if fallback_events is not None:
+                events = fallback_events
+                continue
             _sum_usage(summed_usage, usage)
             yield stamp(_terminal_event(
                 None, base_response, final_output,
@@ -419,6 +540,8 @@ async def fold(
         rt = reasoning_tokens(usage)
         n = tier_n(rt)
         buffered_types = [e["item"].get("type") for e in buffered]
+        buffered_log, buffered_sig = _buffered_log_summary(buffered)
+        same_hidden_output = bool(buffered_sig and buffered_sig == last_hidden_output_sig)
         zero_retry = (
             should_retry_zero_reasoning(base_body, rt)
             # Do not retry Codex prewarm/generate probes or empty-output rounds.
@@ -459,14 +582,17 @@ async def fold(
             )
 
         log.info(
-            "round %d: %s | n=%s zero_retry=%s buffered=%s -> %s",
+            "round %d: %s | n=%s zero_retry=%s buffered=%s buffered_log=%s same_hidden_output=%s -> %s",
             round_no, _fmt(usage), n, zero_retry,
             buffered_types,
+            buffered_log,
+            same_hidden_output,
             "continue" if do_continue else
             "upstream_eof" if terminal is None else stopped_reason or "clean",
         )
 
         if do_continue:
+            last_hidden_output_sig = buffered_sig
             # Replayed reasoning reconstructs hidden continuation state. Keep a
             # single trailing nudge rather than accumulating previous nudges.
             reasoning_replay.extend(round_reasoning)
@@ -502,6 +628,7 @@ async def fold(
                         orig_input + reasoning_replay + [commentary_nudge()],
                     )
                     cont_body.pop("previous_response_id", None)
+                add_turn_state(cont_body)
                 log.info(
                     "open continuation round %d: previous_response_id=%s id_source=%s id_prefix=%s input_items=%d replay_items=%d",
                     round_no + 1,
@@ -513,6 +640,10 @@ async def fold(
                 )
                 events = await open_round(cont_body)
             except RoundOpenError as exc:
+                fallback_events = await open_continuation_fallback(round_no + 1, round_no + 1, exc)
+                if fallback_events is not None:
+                    events = fallback_events
+                    continue
                 log.warning("continuation round %d failed to open: %s", round_no + 1, exc)
                 yield stamp(_terminal_event(
                     None, base_response, final_output,
