@@ -116,6 +116,24 @@ def decompress_body(data: bytes, encoding: str | None) -> bytes:
 # --- upstream SSE rounds ------------------------------------------------------
 
 
+def request_reasoning_meta(body: dict[str, Any]) -> dict[str, Any]:
+    """Privacy-safe metadata about the requested reasoning settings."""
+    reasoning = body.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return {
+            "reasoning_present": reasoning is not None,
+            "reasoning_keys": [],
+            "reasoning_effort": None,
+            "reasoning_summary": None,
+        }
+    return {
+        "reasoning_present": True,
+        "reasoning_keys": sorted(reasoning.keys()),
+        "reasoning_effort": reasoning.get("effort"),
+        "reasoning_summary": reasoning.get("summary"),
+    }
+
+
 def request_shape(headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
     prev = body.get("previous_response_id")
     input_items = body.get("input") or []
@@ -137,6 +155,7 @@ def request_shape(headers: dict[str, str], body: dict[str, Any]) -> dict[str, An
         "parallel_tool_calls": body.get("parallel_tool_calls"),
         "store": body.get("store"),
         "include": body.get("include"),
+        **request_reasoning_meta(body),
         "client_metadata_has_turn_state": X_CODEX_TURN_STATE in client_metadata,
         "header_presence": {
             k: k in {h.lower() for h in headers}
@@ -144,6 +163,100 @@ def request_shape(headers: dict[str, str], body: dict[str, Any]) -> dict[str, An
                       "x-client-request-id", X_CODEX_TURN_STATE)
         },
     }
+
+
+def _summary_text_lengths(summary: Any) -> list[int]:
+    if isinstance(summary, list):
+        out = []
+        for part in summary:
+            if isinstance(part, dict):
+                text = part.get("text")
+            else:
+                text = part
+            out.append(len(text) if isinstance(text, str) else 0)
+        return out
+    if isinstance(summary, str):
+        return [len(summary)]
+    return []
+
+
+def new_upstream_event_stats() -> dict[str, int]:
+    return {
+        "events": 0,
+        "summary_part_added": 0,
+        "summary_part_done": 0,
+        "summary_text_delta": 0,
+        "summary_text_delta_chars": 0,
+        "summary_text_delta_nonempty": 0,
+        "summary_text_done": 0,
+        "summary_text_done_chars": 0,
+        "reasoning_item_added": 0,
+        "reasoning_item_done": 0,
+        "reasoning_item_encrypted": 0,
+        "reasoning_item_summary_key": 0,
+        "reasoning_item_summary_parts": 0,
+        "reasoning_item_summary_chars": 0,
+        "reasoning_item_summary_nonempty": 0,
+        "terminal_reasoning_items": 0,
+        "terminal_reasoning_summary_chars": 0,
+        "terminal_reasoning_summary_nonempty": 0,
+    }
+
+
+def _observe_reasoning_item(stats: dict[str, int], item: Any, prefix: str) -> None:
+    if not isinstance(item, dict) or item.get("type") != "reasoning":
+        return
+    if prefix == "added":
+        stats["reasoning_item_added"] += 1
+    elif prefix == "done":
+        stats["reasoning_item_done"] += 1
+    if item.get("encrypted_content"):
+        stats["reasoning_item_encrypted"] += 1
+    if "summary" in item:
+        stats["reasoning_item_summary_key"] += 1
+        lengths = _summary_text_lengths(item.get("summary"))
+        stats["reasoning_item_summary_parts"] += len(lengths)
+        stats["reasoning_item_summary_chars"] += sum(lengths)
+        if any(length > 0 for length in lengths):
+            stats["reasoning_item_summary_nonempty"] += 1
+
+
+def observe_upstream_event(stats: dict[str, int], ev: dict | object) -> None:
+    if ev is DONE or not isinstance(ev, dict):
+        return
+    stats["events"] += 1
+    etype = ev.get("type")
+    if etype == "response.reasoning_summary_part.added":
+        stats["summary_part_added"] += 1
+    elif etype == "response.reasoning_summary_part.done":
+        stats["summary_part_done"] += 1
+    elif etype == "response.reasoning_summary_text.delta":
+        stats["summary_text_delta"] += 1
+        delta = ev.get("delta")
+        if isinstance(delta, str):
+            stats["summary_text_delta_chars"] += len(delta)
+            if delta:
+                stats["summary_text_delta_nonempty"] += 1
+    elif etype == "response.reasoning_summary_text.done":
+        stats["summary_text_done"] += 1
+        text = ev.get("text")
+        if isinstance(text, str):
+            stats["summary_text_done_chars"] += len(text)
+    elif etype == "response.output_item.added":
+        _observe_reasoning_item(stats, ev.get("item"), "added")
+    elif etype == "response.output_item.done":
+        _observe_reasoning_item(stats, ev.get("item"), "done")
+    if etype in TERMINAL_TYPES:
+        response = ev.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if isinstance(output, list):
+            for item in output:
+                if isinstance(item, dict) and item.get("type") == "reasoning":
+                    stats["terminal_reasoning_items"] += 1
+                    lengths = _summary_text_lengths(item.get("summary"))
+                    stats["terminal_reasoning_summary_chars"] += sum(lengths)
+                    if any(length > 0 for length in lengths):
+                        stats["terminal_reasoning_summary_nonempty"] += 1
 
 
 def parse_sse(text_chunks: AsyncIterator[str]) -> AsyncIterator[dict | object]:
@@ -256,7 +369,34 @@ class UpstreamRounds:
             await resp.aclose()
             raise RoundOpenError(resp.status_code, detail)
         self._resp = resp
-        return parse_sse(resp.aiter_text())
+        events = parse_sse(resp.aiter_text())
+        stats = new_upstream_event_stats()
+        shape = self._body_shape(body)
+
+        async def traced_events() -> AsyncIterator[dict | object]:
+            terminal_seen = False
+            try:
+                async for ev in events:
+                    observe_upstream_event(stats, ev)
+                    if isinstance(ev, dict) and ev.get("type") in TERMINAL_TYPES:
+                        terminal_seen = True
+                        log.info(
+                            "upstream SSE terminal: type=%s status=%s request_shape=%s summary_stats=%s",
+                            ev.get("type"),
+                            (ev.get("response") or {}).get("status"),
+                            json.dumps(shape, ensure_ascii=False),
+                            json.dumps(stats, ensure_ascii=False),
+                        )
+                    yield ev
+            finally:
+                if not terminal_seen and stats["events"]:
+                    log.info(
+                        "upstream SSE ended before terminal: request_shape=%s summary_stats=%s",
+                        json.dumps(shape, ensure_ascii=False),
+                        json.dumps(stats, ensure_ascii=False),
+                    )
+
+        return traced_events()
 
     async def aclose(self) -> None:
         if self._resp is not None:
@@ -368,6 +508,7 @@ class UpstreamWsRounds:
         payload = dict(body)
         payload["type"] = "response.create"
         shape = request_shape(self.headers, body)
+        stats = new_upstream_event_stats()
         log.info(
             "open upstream websocket round: request_shape=%s",
             json.dumps(shape, ensure_ascii=False),
@@ -391,17 +532,19 @@ class UpstreamWsRounds:
                     except asyncio.TimeoutError as exc:
                         await self.aclose()
                         log.warning(
-                            "upstream websocket timed out before terminal: request_shape=%s",
+                            "upstream websocket timed out before terminal: request_shape=%s summary_stats=%s",
                             json.dumps(shape, ensure_ascii=False),
+                            json.dumps(stats, ensure_ascii=False),
                         )
                         raise TimeoutError("upstream websocket read timeout") from exc
                     except ConnectionClosed as exc:
                         self._ws = None
                         log.info(
-                            "upstream websocket closed before terminal: code=%s reason=%s request_shape=%s",
+                            "upstream websocket closed before terminal: code=%s reason=%s request_shape=%s summary_stats=%s",
                             getattr(exc, "code", None),
                             str(getattr(exc, "reason", ""))[:200],
                             json.dumps(shape, ensure_ascii=False),
+                            json.dumps(stats, ensure_ascii=False),
                         )
                         raise ConnectionError(
                             f"upstream websocket closed: {getattr(exc, 'code', None)}"
@@ -413,6 +556,7 @@ class UpstreamWsRounds:
                     except json.JSONDecodeError:
                         log.warning("unparseable upstream WS event (len=%d), dropped", len(raw))
                         continue
+                    observe_upstream_event(stats, ev)
                     etype = ev.get("type")
                     if first:
                         log.info(
@@ -427,8 +571,9 @@ class UpstreamWsRounds:
                             log.info("upstream websocket response.metadata turn_state=yes")
                     if ev.get("type") == "error":
                         log.warning(
-                            "upstream websocket error frame: request_shape=%s error=%s",
+                            "upstream websocket error frame: request_shape=%s summary_stats=%s error=%s",
                             json.dumps(shape, ensure_ascii=False),
+                            json.dumps(stats, ensure_ascii=False),
                             json.dumps(self._ws_error_summary(ev), ensure_ascii=False),
                         )
                         if not emitted:
@@ -440,10 +585,11 @@ class UpstreamWsRounds:
                         raise ConnectionError(redact_ids(json.dumps(ev, ensure_ascii=False)))
                     if etype in TERMINAL_TYPES:
                         log.info(
-                            "upstream websocket terminal: type=%s status=%s request_shape=%s",
+                            "upstream websocket terminal: type=%s status=%s request_shape=%s summary_stats=%s",
                             etype,
                             (ev.get("response") or {}).get("status"),
                             json.dumps(shape, ensure_ascii=False),
+                            json.dumps(stats, ensure_ascii=False),
                         )
                         emitted = True
                         self.last_used = time.monotonic()

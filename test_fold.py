@@ -531,6 +531,38 @@ async def main():
         [(b"accept", b"application/json"), (b"host", b"localhost")]
     ).get("accept") == "application/json"
 
+    shape = server.request_shape({}, {
+        "model": "gpt-5.5",
+        "input": [],
+        "reasoning": {"effort": "high", "summary": "detailed"},
+    })
+    assert shape["reasoning_effort"] == "high"
+    assert shape["reasoning_summary"] == "detailed"
+    assert shape["reasoning_keys"] == ["effort", "summary"]
+
+    stats = server.new_upstream_event_stats()
+    for ev in [
+        {"type": "response.reasoning_summary_part.added", "summary_index": 0},
+        {"type": "response.reasoning_summary_text.delta", "delta": "abc"},
+        {"type": "response.reasoning_summary_text.done", "text": "abc"},
+        {"type": "response.output_item.done", "item": {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "abc"}],
+            "encrypted_content": "ENC",
+        }},
+        {"type": "response.completed", "response": {"status": "completed", "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "done"}]},
+        ]}},
+    ]:
+        server.observe_upstream_event(stats, ev)
+    assert stats["summary_part_added"] == 1
+    assert stats["summary_text_delta_chars"] == 3
+    assert stats["summary_text_done_chars"] == 3
+    assert stats["reasoning_item_done"] == 1
+    assert stats["reasoning_item_encrypted"] == 1
+    assert stats["reasoning_item_summary_nonempty"] == 1
+    assert stats["terminal_reasoning_summary_nonempty"] == 1
+
     class NoCallClient:
         def build_request(self, *args, **kwargs):
             raise AssertionError("previous_response_id should be rejected before HTTP")
