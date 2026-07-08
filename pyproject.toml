@@ -32,6 +32,7 @@ Issues = "https://github.com/dzshzx/codexcomp/issues"
 
 [project.scripts]
 codexcomp = "codexcomp.cli:main"
+codexcomp-eval = "codexcomp.candy_eval:main"
 
 # Windowless launcher (GUI subsystem on Windows → no console window at logon).
 # Use it as the target of a manually-created Startup shortcut on Windows.

@@ -158,19 +158,25 @@ as-is), `compaction_request` (remote-compaction request — never folded),
 
 ## Evals
 
-`evals/candy_eval.py` measures the fix end-to-end: it runs a model × effort ×
+The candy A/B eval ships inside the package and is available as `codexcomp-eval`
+right after install. It measures the fix end-to-end: a model × effort ×
 proxy-on/off grid of `codex exec` calls on the candy pigeonhole puzzle from
 [haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
-(answer: 21, independently re-verified by brute force) and reports boundary-cut
+(answer: 21, independently re-verified by brute force), reporting boundary-cut
 rate, reasoning tokens and accuracy per condition. Both modes wire
-`openai_base_url` explicitly, so the ambient config doesn't matter; interrupted
-grids resume by re-running the same command.
+`openai_base_url` explicitly, so the ambient config doesn't matter; results
+append to `<out>/results.jsonl`, so an interrupted grid resumes by re-running
+the same command. Per-round fold detail for `on` runs is read from the systemd
+user unit's journal when it is active. The harness wraps `codex exec` in
+coreutils `timeout`, so it needs Linux/WSL (macOS needs coreutils).
 
 ```bash
-codexcomp &                                    # proxy must be running for `on`
-python evals/candy_eval.py -m gpt-5.5 -r xhigh -n 5   # small grid
-python evals/candy_eval.py                            # full 80-run grid
+codexcomp &                                     # proxy must be running for `on`
+codexcomp-eval -m gpt-5.5 -r xhigh -n 5         # small grid
+codexcomp-eval                                  # full 80-run grid
 ```
+
+Inside a checkout use `uv run codexcomp-eval` for the same thing.
 
 An 80-run grid of this eval (2026-07-06) found every unmitigated gpt-5.5 run
 cut exactly on a `518n−2` boundary, 15% vs 90% accuracy off/on — details in
@@ -242,3 +248,6 @@ Built for and shared with the [**LINUX DO**](https://linux.do) community, where 
 [MIT](LICENSE) — mechanism credit to
 [**neteroster/CodexCont**](https://github.com/neteroster/CodexCont) (MIT), whose 518n−2
 detect-and-continue idea this reuses with an independent, from-scratch implementation.
+The candy puzzle eval task and its standalone-21 grading rule come from
+[**haowang02/codex-candy-eval**](https://github.com/haowang02/codex-candy-eval) — the task
+prompt is reproduced with attribution (the upstream repo declares no license).

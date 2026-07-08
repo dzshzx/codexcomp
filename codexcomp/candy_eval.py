@@ -27,8 +27,8 @@ next run starts; the harness waits after a failed `on` run to keep the next
 cursor window clean, but concurrent foreign traffic cannot be told apart.
 
 Usage:
-  python evals/candy_eval.py                          # default grid, 5 reps
-  python evals/candy_eval.py -m gpt-5.5 -r xhigh -n 3 --modes on,off
+  codexcomp-eval                                      # default grid, 5 reps
+  codexcomp-eval -m gpt-5.5 -r xhigh -n 3 --modes on,off
 Results append to <out>/results.jsonl; completed run ids are skipped, so an
 interrupted eval resumes by re-running the same command.
 """
