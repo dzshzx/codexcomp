@@ -18,7 +18,7 @@ uv build                       # build sdist + wheel
 
 There is no pytest/lint/typecheck setup — both tests are plain scripts with asserts, run them directly. Run `test_fold.py` before any change to `fold.py`, `test_ws.py` before any change to `server.py`'s WebSocket path.
 
-Release checklist (do every step, in order): bump `version` in `pyproject.toml` → commit → push `main` → push the matching `v*` tag → wait for `.github/workflows/release.yml` to go green (it builds and publishes to PyPI via Trusted Publishing — OIDC, no stored token) → confirm the version is live on PyPI → create the GitHub Release with `gh release create v* --title … --notes-file …` (the workflow does NOT do this; a pushed tag with no Release leaves the Releases page showing a stale latest).
+Release checklist (do every step, in order): bump `version` in `pyproject.toml` → commit → push `main` → push the matching `v*` tag → wait for `.github/workflows/release.yml` to go green (it builds and publishes to PyPI via Trusted Publishing — OIDC, no stored token) → confirm the version is live on PyPI → create the GitHub Release with `gh release create v* --title … --notes-file …` (the workflow does NOT do this; a pushed tag with no Release leaves the Releases page showing a stale latest; notes are English-first with a short `### 中文说明` supplement after a `---`).
 
 ## Architecture
 
