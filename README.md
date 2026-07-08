@@ -94,7 +94,8 @@ A state machine (`codexcomp/fold.py`) runs per round:
    see `--max-n` / `--max-continue`) marks the round as truncated.
 2. **Continue** — discard the tentative output and replay the round's reasoning items (incl.
    `encrypted_content`) plus one `phase:"commentary"` `"Continue thinking..."` message as the
-   next input.
+   next input. If a continuation round comes back with zero reasoning tokens (the nudge
+   stalled), it is re-nudged rather than accepted, spending from the same `--max-continue` budget.
 3. **Fold** — stream reasoning live, flush only the final clean round, and rebuild the terminal
    event as one response (reasoning summed, true cost under `metadata.proxy_billed_usage`).
 

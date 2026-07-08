@@ -5,6 +5,8 @@ When a round ends on that fingerprint we replay the conversation plus the round'
 reasoning items and a phase:"commentary" nudge, then fold every round into ONE
 downstream response: reasoning streams live, each round's tentative final output
 (message / tool calls) is buffered and only the clean round's output is flushed.
+A continuation round that returns zero reasoning tokens is treated as a stalled
+nudge and re-nudged within the same MAX_CONTINUE budget.
 
 Transport-agnostic: `fold()` consumes upstream events as dicts and yields
 downstream events as dicts; serialization (SSE / WebSocket) lives in server.py.
@@ -363,19 +365,24 @@ async def _fold_inner(
         rounds_info.append({"round": round_no, "reasoning_tokens": rt, "n": n})
         stats["rounds"], stats["usage"] = round_no, summed_usage
         has_enc = bool(round_reasoning and round_reasoning[-1].get("encrypted_content"))
+        # A continuation round is one we explicitly nudged after a confirmed
+        # truncation; zero reasoning there means the nudge failed and the
+        # collapse continues, so re-nudge. Round 1's zero reasoning is a valid
+        # complete answer and is NOT in scope (strict ==0; rt is None — missing
+        # usage or a failed terminal — must not enter the retry loop).
+        zero_stall = round_no >= 2 and rt == 0
 
         do_continue = (
             terminal is not None
             and not is_compaction
-            and in_continue_window(n)
-            and has_enc
             and round_no <= MAX_CONTINUE
+            and ((in_continue_window(n) and has_enc) or zero_stall)
         )
         stopped_reason = None
-        if not do_continue and n is not None:
+        if not do_continue and (n is not None or zero_stall):
             stopped_reason = (
                 "compaction_request" if is_compaction
-                else "no_encrypted_content" if not has_enc
+                else "no_encrypted_content" if n is not None and not has_enc
                 else "max_continue" if round_no > MAX_CONTINUE
                 else "tier_out_of_window"
             )

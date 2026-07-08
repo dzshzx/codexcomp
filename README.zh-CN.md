@@ -86,7 +86,8 @@ openai_base_url = "http://127.0.0.1:8787/v1"
 1. **检测** — `reasoning_tokens == 518n − 2`（默认不限档位，实测最高见过 n=21 的截断；
    见 `--max-n` / `--max-continue`）即判定该轮被截断。
 2. **续写** — 丢弃该轮暂定输出，将其 reasoning items（含 `encrypted_content`）连同一条
-   `phase:"commentary"` 的 `"Continue thinking..."` 消息重放为下一轮 input。
+   `phase:"commentary"` 的 `"Continue thinking..."` 消息重放为下一轮 input。若某续写轮返回零
+   推理 token（续写提示落空），则再次续写而非接受，消耗同一 `--max-continue` 预算。
 3. **折叠** — 推理流全程实时透传，仅放行收尾轮的最终输出，并将 terminal 事件重建为单个响应
    （reasoning 累加，真实累计开销记于 `metadata.proxy_billed_usage`）。
 
