@@ -14,6 +14,7 @@ uv run python test_fold.py     # fold state-machine self-test → "ALL PASS"
 uv run python test_ws.py       # WS stateful-protocol (prewarm/incremental) self-test → "ALL PASS"
 uv run codexcomp               # run the proxy locally (foreground, 127.0.0.1:8787)
 uv run codexcomp-eval          # candy A/B eval (spends real tokens; run manually as needed)
+uv run codexcomp-sudoku-eval   # hard 6×6 sudoku A/B eval — longer reasoning stress test (spends real tokens)
 uv build                       # build sdist + wheel
 ```
 
@@ -30,7 +31,7 @@ Four small modules under `codexcomp/`, with one central seam:
 - **`cli.py`** — argparse entry for both `codexcomp` (console) and `codexcompw` (Windows GUI-subsystem, windowless). `_bind_headless_streams()` exists because pythonw starts with `sys.stdout/stderr = None`, which would crash uvicorn at startup — don't remove it. A wired proxy must own its exact port: if the port is busy it fails loudly and exits (no port drift, by design).
 - **`service.py`** — strictly opt-in autostart: systemd user unit (Linux/WSL), launchd LaunchAgent (macOS), manual Startup-shortcut instructions only on Windows (no silent registration — AV heuristics). Installing the package never registers anything.
 
-`candy_eval.py` also lives under `codexcomp/` but is not part of the proxy data path: it's a self-contained (stdlib-only) A/B eval harness shipped with the package as the `codexcomp-eval` console script.
+`eval_harness.py`, `candy_eval.py` and `sudoku_eval.py` also live under `codexcomp/` but are not part of the proxy data path: they are a stdlib-only A/B eval harness shipped with the package. `eval_harness.py` owns all the puzzle-agnostic machinery (the `codex exec` model×effort×proxy-on/off grid, journal fold-round capture, 518n−2 boundary detection, resume, summary) and exposes `run_eval(spec)`; each eval script is just an `EvalSpec` (prompt + grader + output dir) — `candy_eval.py` is the candy pigeonhole puzzle (answer 21) as `codexcomp-eval`, `sudoku_eval.py` is a harder 6×6 arithmetic-cage sudoku (verification code 5322366662) as `codexcomp-sudoku-eval`, whose longer chained deduction pushes reasoning far enough to exercise the fold across many rounds. Add a new puzzle by writing one more `EvalSpec`, not by copying the harness.
 
 ## Invariants to preserve
 
