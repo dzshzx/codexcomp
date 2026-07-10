@@ -3,5 +3,5 @@ __pycache__/
 *.pyc
 *.log
 dist/
-evals/results/
+evals/
 .scratch/

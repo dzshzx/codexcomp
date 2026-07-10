@@ -19,10 +19,13 @@ run. Without the unit (e.g. a foreground `codexcomp`), the summary falls back
 to final-usage fingerprints, which undercounts folded runs (folded usage is
 summed across rounds and usually leaves the 518n-2 lattice).
 
-Assumptions: runs are serial and the proxy serves no other traffic during the
-eval. If a run times out, the proxy may still be finishing that fold when the
-next run starts; the harness waits after a failed `on` run to keep the next
-cursor window clean, but concurrent foreign traffic cannot be told apart.
+Runs are serial by default because per-round journal capture attributes fold
+lines to a run by a time-cursor window, which needs one run at a time (and the
+proxy serving no other traffic). `--parallel N` opts into N concurrent runs:
+faster, but it disables per-round journal capture (folded runs are then detected
+from usage fingerprints only) and spends tokens faster. In serial mode, if a run
+times out the proxy may still be finishing that fold when the next starts, so the
+harness waits after a failed `on` run to keep the next cursor window clean.
 
 Results append to <out>/results.jsonl; completed run ids are skipped, so an
 interrupted eval resumes by re-running the same command.
@@ -35,7 +38,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,12 +58,13 @@ class EvalSpec:
     prompt: str                      # task prompt handed to `codex exec`
     grader: Callable[[str], bool]    # final-message text -> correct?
     default_out: str                 # default output directory
-    default_models: str = "gpt-5.4,gpt-5.5"
+    default_models: str = "gpt-5.5"
 
 
 STEP = 518
 BOUNDARIES = {STEP * n - 2 for n in range(1, 41)}
-TIMEOUTS = {"low": 600, "medium": 600, "high": 1200, "xhigh": 1800}
+TIMEOUTS = {"low": 600, "medium": 600, "high": 1200, "xhigh": 1800,
+            "max": 2400, "ultra": 3600}
 # fold.py round verdicts that mean "a 518n-2 truncation was detected"
 TRUNCATION_VERDICTS = {"continue", "tier_out_of_window", "max_continue",
                        "no_encrypted_content"}
@@ -215,17 +221,22 @@ def run_eval(spec: EvalSpec) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-m", "--models", default=spec.default_models,
                         help="comma-separated model list")
-    parser.add_argument("-r", "--efforts", default="low,medium,high,xhigh",
+    parser.add_argument("-r", "--efforts", default="medium,xhigh",
                         help="comma-separated reasoning efforts")
     parser.add_argument("--modes", default="on,off",
                         help="comma-separated: on (via proxy) / off (direct)")
-    parser.add_argument("-n", "--reps", type=int, default=5)
+    parser.add_argument("-n", "--reps", type=int, default=4)
     parser.add_argument("--proxy", default="http://127.0.0.1:8787/v1",
                         help="codexcomp base URL for `on` runs")
     parser.add_argument("--upstream", default="https://chatgpt.com/backend-api/codex",
                         help="direct base URL for `off` runs")
     parser.add_argument("--out", default=spec.default_out,
                         help="output directory (results.jsonl + per-run artifacts)")
+    parser.add_argument("--parallel", type=int, default=1, metavar="N",
+                        help="run up to N codex exec calls concurrently (default 1 = "
+                             "serial). N>1 speeds the grid up but disables per-round "
+                             "journal capture and spends tokens faster (expect more "
+                             "rate-limit errors); opt in only when you want it.")
     args = parser.parse_args()
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -237,6 +248,8 @@ def run_eval(spec: EvalSpec) -> int:
     for mode in modes:
         if mode not in ("on", "off"):
             parser.error(f"unknown mode {mode!r} (choose from on, off)")
+    if args.parallel < 1:
+        parser.error("--parallel must be >= 1")
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -248,41 +261,60 @@ def run_eval(spec: EvalSpec) -> int:
     done_ids = {r["id"] for r in recs}
 
     use_journal = "on" in modes and proxy_unit_active()
+    if use_journal and args.parallel > 1:
+        print("note: --parallel N>1 interleaves runs in the journal, so per-round "
+              "fold attribution is disabled; folded runs are detected from usage "
+              "fingerprints only (the 518n-2 lattice), which undercounts them.")
+        use_journal = False
     if "on" in modes and not use_journal:
-        print("note: codexcomp systemd user unit not active — per-round fold "
-              "data will be missing; folded runs are undercounted from usage alone.")
+        print("note: per-round fold data unavailable (systemd unit inactive or "
+              "--parallel set) — folded runs are undercounted from usage alone.")
 
     grid = [(model, effort, mode, rep)
             for rep in range(1, args.reps + 1)  # interleave conditions across time
             for model in models for effort in efforts for mode in modes]
     grid_ids = {f"{m}_{e}_{md}_r{r}" for m, e, md, r in grid}
-    done_in_grid = len(grid_ids & done_ids)
-    warned_no_fold = False
+    pending = [c for c in grid
+               if f"{c[0]}_{c[1]}_{c[2]}_r{c[3]}" not in done_ids]
+    counter = {"done": len(grid_ids & done_ids), "warned_no_fold": False}
+    lock = threading.Lock()
 
-    for model, effort, mode, rep in grid:
+    def record(rec: dict) -> None:
+        # serialize result persistence + progress print across worker threads
+        with lock:
+            recs.append(rec)
+            counter["done"] += 1
+            with open(results_path, "a") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"[{iso_now()}] {counter['done']}/{len(grid)} {rec['id']} "
+                  f"exit={rec['exit']} reason={rec['reasoning_tokens']} "
+                  f"correct={rec['correct']}", flush=True)
+            if (use_journal and rec["mode"] == "on" and rec["exit"] == 0
+                    and not rec["fold_rounds"] and not counter["warned_no_fold"]):
+                print("warning: an `on` run produced no fold lines in the journal — "
+                      "the unit may log above info level, journald may lag, or Codex "
+                      "traffic isn't reaching the systemd codexcomp unit")
+                counter["warned_no_fold"] = True
+
+    def do(cell: tuple) -> dict:
+        model, effort, mode, rep = cell
         run_id = f"{model}_{effort}_{mode}_r{rep}"
-        if run_id in done_ids:
-            continue
-        rec = run_once(args, out_dir, run_id, model, effort, mode,
-                       use_journal, workdir, spec)
-        recs.append(rec)
-        done_in_grid += 1
-        with open(results_path, "a") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        print(f"[{iso_now()}] {done_in_grid}/{len(grid)} {run_id} "
-              f"exit={rec['exit']} reason={rec['reasoning_tokens']} "
-              f"correct={rec['correct']}", flush=True)
-        if (use_journal and mode == "on" and rec["exit"] == 0
-                and not rec["fold_rounds"] and not warned_no_fold):
-            print("warning: an `on` run produced no fold lines in the journal — "
-                  "the unit may log above info level, journald may lag, or Codex "
-                  "traffic isn't reaching the systemd codexcomp unit")
-            warned_no_fold = True
-        if mode == "on" and rec["exit"] != 0:
-            # the proxy may still be finishing this run's fold; keep its late
-            # log lines out of the next run's cursor window
-            time.sleep(ORPHAN_FOLD_GRACE_S)
-        time.sleep(2)
+        return run_once(args, out_dir, run_id, model, effort, mode,
+                        use_journal, workdir, spec)
+
+    if args.parallel > 1:
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            for fut in as_completed([pool.submit(do, c) for c in pending]):
+                record(fut.result())
+    else:
+        for cell in pending:
+            rec = do(cell)
+            record(rec)
+            if cell[2] == "on" and rec["exit"] != 0:
+                # the proxy may still be finishing this run's fold; keep its late
+                # log lines out of the next run's cursor window
+                time.sleep(ORPHAN_FOLD_GRACE_S)
+            time.sleep(2)
 
     print()
     grid_recs = [r for r in recs if r["id"] in grid_ids]  # match the counter's scope
