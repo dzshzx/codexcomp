@@ -38,12 +38,13 @@ RoundOpener = Callable[[dict[str, Any]], Awaitable[AsyncIterator[dict[str, Any]]
 
 
 class RoundOpenError(Exception):
-    """A round could not be opened (upstream HTTP >= 400). Raised by the
+    """A round could not be opened (upstream HTTP >= 400 or transport error). Raised by the
     opener; always handled inside fold(), never escapes to the transport."""
 
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, *, code: str | None = None):
         super().__init__(f"upstream {status}: {detail[:200]}")
         self.status = status
+        self.code = code or f"upstream_{status}"
 
 
 DONE = object()  # sentinel an opener may yield to signal upstream sent [DONE]
@@ -201,7 +202,7 @@ def _failed_event(exc: RoundOpenError) -> dict[str, Any]:
     return {
         "type": "response.failed",
         "response": {"status": "failed",
-                     "error": {"message": str(exc), "code": exc.status}},
+                     "error": {"message": str(exc), "code": exc.code}},
     }
 
 

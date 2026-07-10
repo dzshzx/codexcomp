@@ -60,6 +60,10 @@ def upstream_headers(raw: Any) -> dict[str, str]:
     return out
 
 
+def _http_error_detail(exc: httpx.HTTPError) -> str:
+    return str(exc) or repr(exc.__cause__) or repr(exc)
+
+
 def decompress_body(data: bytes, encoding: str | None) -> bytes:
     enc = (encoding or "").lower().strip()
     if not enc or enc == "identity":
@@ -138,7 +142,19 @@ class UpstreamRounds:
             headers=headers,
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
-        resp = await self.client.send(req, stream=True)
+        try:
+            resp = await self.client.send(req, stream=True)
+        except httpx.HTTPError as exc:
+            # No retry: send() may fail after the request reached the upstream
+            # (e.g. ReadTimeout), and a re-send would double-generate the turn.
+            detail = _http_error_detail(exc)
+            log.warning("round open upstream transport error: %s: %s",
+                        type(exc).__name__, detail)
+            raise RoundOpenError(
+                502,
+                f"{type(exc).__name__}: {detail}",
+                code="upstream_connection_error",
+            ) from exc
         if resp.status_code >= 400:
             detail = (await resp.aread()).decode(errors="replace")
             await resp.aclose()
@@ -406,10 +422,20 @@ async def passthrough(request: Request) -> Response:
     if content:
         content = decompress_body(content, request.headers.get("content-encoding"))
     headers = upstream_headers(request.headers.raw)
-    upstream = await request.app.state.client.request(
-        request.method, url, content=content or None, headers=headers,
-        timeout=httpx.Timeout(60),
-    )
+    try:
+        upstream = await request.app.state.client.request(
+            request.method, url, content=content or None, headers=headers,
+            timeout=httpx.Timeout(60),
+        )
+    except httpx.HTTPError as exc:
+        detail = _http_error_detail(exc)
+        log.warning("passthrough upstream error for %s /v1/%s: %s",
+                    request.method, suffix, detail)
+        return JSONResponse(
+            {"error": {"message": f"upstream connection error: {type(exc).__name__}: {detail}",
+                       "code": "upstream_connection_error"}},
+            status_code=502,
+        )
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,

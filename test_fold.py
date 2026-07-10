@@ -183,7 +183,7 @@ async def test_round1_rejected():
     ev = out[0]
     assert ev["type"] == "response.failed", ev
     assert ev["response"]["status"] == "failed"
-    assert ev["response"]["error"]["code"] == 429
+    assert ev["response"]["error"]["code"] == "upstream_429"
     assert "quota exceeded" in ev["response"]["error"]["message"]
     assert ev["sequence_number"] == 0
 

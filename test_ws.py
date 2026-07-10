@@ -59,6 +59,8 @@ def mock_upstream(request: httpx.Request) -> httpx.Response:
     body = json.loads(request.content)
     upstream_calls.append(body)
     upstream_request_headers.append(request.headers)
+    if body.get("model") == "connect-fail":
+        raise httpx.ConnectError("proxy TLS failed", request=request)
     if body.get("model") == "fail-me":
         return httpx.Response(400, json={"detail": "boom"})
     rid = f"resp_up_{len(upstream_calls)}"
@@ -166,6 +168,22 @@ def test_failed_turn_invalidates_state():
         assert frame["response"]["error"]["code"] == "unknown_previous_response_id"
 
 
+def test_ws_connect_error_yields_failed_terminal():
+    """A transport-level upstream open failure must not escape into ASGI."""
+    client = make_client()
+    with client.websocket_connect("/v1/responses") as ws:
+        ws.send_text(json.dumps({"type": "response.create", "model": "connect-fail",
+                                 "stream": True, "input": [USER1]}))
+        frame = json.loads(ws.receive_text())
+        assert frame["type"] == "response.failed", frame
+        assert frame["response"]["status"] == "failed"
+        err = frame["response"]["error"]
+        assert err["code"] == "upstream_connection_error"
+        assert "ConnectError" in err["message"]
+        assert "proxy TLS failed" in err["message"]
+        assert len(upstream_calls) == 1  # no retry: a re-send could double-generate
+
+
 def test_post_sse_unchanged():
     """The HTTP fallback path still passes full-input bodies straight through."""
     client = make_client()
@@ -219,6 +237,22 @@ def test_ws_handshake_stays_bare():
         assert b"x-reasoning-included" not in names, ws.extra_headers
 
 
+def test_passthrough_connect_error_returns_502():
+    """GET /v1/models is outside fold(); transport failures still need a response."""
+    def failing_upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("proxy TLS failed", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(failing_upstream))
+    client = TestClient(app)
+    resp = client.get("/v1/models?client_version=0.143.0")
+    assert resp.status_code == 502, resp.text
+    err = resp.json()["error"]
+    assert err["code"] == "upstream_connection_error"
+    assert "ConnectError" in err["message"]
+    assert "proxy TLS failed" in err["message"]
+
+
 def clear_state():
     upstream_calls.clear()
     upstream_request_headers.clear()
@@ -228,10 +262,12 @@ def main():
     for test in (test_prewarm_then_incremental,
                  test_unknown_previous_response,
                  test_failed_turn_invalidates_state,
+                 test_ws_connect_error_yields_failed_terminal,
                  test_post_sse_unchanged,
                  test_post_header_propagation,
                  test_turn_state_replayed_on_continuation,
-                 test_ws_handshake_stays_bare):
+                 test_ws_handshake_stays_bare,
+                 test_passthrough_connect_error_returns_502):
         clear_state()
         test()
     print("ws transport self-test: ALL PASS")
