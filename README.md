@@ -158,27 +158,38 @@ as-is), `compaction_request` (remote-compaction request — never folded),
 
 ## Evals
 
-The candy A/B eval ships inside the package and is available as `codexcomp-eval`
-right after install. It measures the fix end-to-end: a model × effort ×
-proxy-on/off grid of `codex exec` calls on the candy pigeonhole puzzle from
-[haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
-(answer: 21, independently re-verified by brute force), reporting boundary-cut
-rate, reasoning tokens and accuracy per condition. Both modes wire
-`openai_base_url` explicitly, so the ambient config doesn't matter; results
-append to `<out>/results.jsonl`, so an interrupted grid resumes by re-running
-the same command. Per-round fold detail for `on` runs is read from the systemd
-user unit's journal when it is active. The harness wraps `codex exec` in
-coreutils `timeout`, so it needs Linux/WSL (macOS needs coreutils).
+Two A/B evals ship inside the package and are available right after install.
+Both measure the fix end-to-end: a model × effort × proxy-on/off grid of
+`codex exec` calls, reporting boundary-cut rate, reasoning tokens and accuracy
+per condition:
+
+- `codexcomp-eval` — the candy pigeonhole puzzle from
+  [haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
+  (answer: 21, independently re-verified by brute force); a short trap-style
+  question that under-thinking runs get wrong fast.
+- `codexcomp-sudoku-eval` — a hard 6×6 arithmetic-cage sudoku with no given
+  cells; its long chained deduction spends far more reasoning tokens and hits
+  the `518n−2` lattice across many rounds — a stress test for fold stability.
+
+Both modes wire `openai_base_url` explicitly, so the ambient config doesn't
+matter; results append to `<out>/results.jsonl`, so an interrupted grid resumes
+by re-running the same command. Per-round fold detail for `on` runs is read from
+the systemd user unit's journal when it is active. Runs are serial by default;
+`--parallel N` opts into N concurrent runs — faster, but it disables per-round
+journal capture (folded runs are then detected from usage fingerprints only) and
+spends tokens faster. The harness wraps `codex exec` in coreutils `timeout`, so
+it needs Linux/WSL (macOS needs coreutils).
 
 ```bash
 codexcomp &                                     # proxy must be running for `on`
 codexcomp-eval -m gpt-5.5 -r xhigh -n 5         # small grid
-codexcomp-eval                                  # full 80-run grid
+codexcomp-eval                                  # default grid (gpt-5.5 × medium,xhigh × on/off × 4 reps)
+codexcomp-sudoku-eval -r xhigh,ultra,max        # long-reasoning stress grid
 ```
 
 Inside a checkout use `uv run codexcomp-eval` for the same thing.
 
-An 80-run grid of this eval (2026-07-06) found every unmitigated gpt-5.5 run
+An 80-run grid of the candy eval (2026-07-06) found every unmitigated gpt-5.5 run
 cut exactly on a `518n−2` boundary, 15% vs 90% accuracy off/on — details in
 [openai/codex#30364](https://github.com/openai/codex/issues/30364#issuecomment-4893087004).
 
@@ -192,6 +203,13 @@ No. Clean rounds pass through byte-for-byte; the fold path only engages on a det
 Continuation rounds spend extra real tokens, bounded by the continuation cap
 (`--max-continue`, default 3). The true cumulative usage is reported under
 `metadata.proxy_billed_usage`.
+
+**Does it work with the gpt-5.6 series?**
+Yes — the `518n−2` lattice still appears on gpt-5.6 and folding engages exactly as on
+gpt-5.5. But much of the 5.6 accuracy drop (notably `terra` below `max` effort, and `luna`)
+is a different failure mode: reasoning collapses to a few hundred tokens at *non-lattice*
+values — legitimate under-thinking, not truncation — which no proxy can detect or fix.
+Grid data in [#11](https://github.com/dzshzx/codexcomp/issues/11).
 
 **What happens when OpenAI fixes this upstream?**
 Nothing breaks — the detector simply stops firing and the proxy becomes a transparent
