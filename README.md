@@ -167,8 +167,8 @@ per condition:
   [haowang02/codex-candy-eval](https://github.com/haowang02/codex-candy-eval)
   (answer: 21, independently re-verified by brute force); a short trap-style
   question that under-thinking runs get wrong fast.
-- `codexcomp-sudoku-eval` — a hard 6×6 arithmetic-cage sudoku with no given
-  cells; its long chained deduction spends far more reasoning tokens and hits
+- `codexcomp-sudoku-eval` — a hard 6×6 arithmetic-cage sudoku with four given
+  anchor cells; its chained deduction spends far more reasoning tokens and hits
   the `518n−2` lattice across many rounds — a stress test for fold stability.
 
 Both modes wire `openai_base_url` explicitly, so the ambient config doesn't

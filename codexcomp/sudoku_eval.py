@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """A/B eval: does codexcomp's folding hold up on a long-reasoning sudoku?
 
-Drives a hard 6x6 arithmetic-cage sudoku (KenKen-style, with NO given cells —
-every value must be derived from the cages plus the Latin-square rules) through
-the shared eval harness (codexcomp.eval_harness) across a model x effort x
-proxy-on/off grid. This puzzle is deliberately harder than the candy pigeonhole
-one, and harder than a fixed-cell variant: without any anchors its unique
-solution needs a long chained deduction, so runs spend far more reasoning tokens
-and hit the 518n-2 truncation lattice more often — a stress test for whether
-continuation folding stays stable across many rounds. (Empirically, low effort
-usually can't crack it; medium and up solve it.)
+Drives a hard 6x6 arithmetic-cage sudoku (KenKen-style) through the shared eval
+harness (codexcomp.eval_harness) across a model x effort x proxy-on/off grid.
+The four cells not covered by any cage (r1c3, r4c1, r4c4, r6c1) are given as
+fixed anchors, which bounds run times; the rest still needs a chained deduction,
+so runs spend far more reasoning tokens than the candy pigeonhole puzzle and hit
+the 518n-2 truncation lattice across many rounds — a stress test for whether
+continuation folding stays stable.
 
 The unique solution's 10-digit verification code is 5322366662 (read from
 r1c4 r2c6 r3c2 r4c5 r5c1 r6c6 r2c3 r3c5 r5c4 r6c1); a run is graded correct iff
@@ -57,9 +55,9 @@ PROMPT = """你必须完全依靠内部推理作答。
 × 表示笼区内所有数字之积。
 - 只用于两个格子，表示两个数字差的绝对值。
 ÷ 只用于两个格子，表示较大数除以较小数。
+= 表示该格固定为给定数字。
 
 没有列入笼区列表的格子没有额外笼区约束，只需满足行列规则。
-本题没有固定格。
 
 笼区列表：
 
@@ -76,6 +74,10 @@ PROMPT = """你必须完全依靠内部推理作答。
 11. r2c1 r2c2 r3c1：+10
 12. r5c1 r5c2：+7
 13. r5c3 r5c4：-4
+14. r1c3：=4
+15. r4c1：=5
+16. r4c4：=1
+17. r6c1：=2
 
 解出完整方阵后，按以下坐标读取数字，拼成 10 位验证码：
 
