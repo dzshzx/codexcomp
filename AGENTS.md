@@ -1,6 +1,6 @@
 # Agent Rules
 
-Full development guide (architecture, commands, release checklist) lives in `CLAUDE.md` — read @CLAUDE.md before starting any task.
+Full development guide (architecture, commands, release checklist) lives in `CLAUDE.md` — reading @CLAUDE.md once at the start of a session is recommended; no need to re-read it later in the same session.
 Machine-wide behavior contract and machine facts are carried by the global instruction layer; this file only records project facts a non-Claude agent must know.
 
 ## Project boundaries
