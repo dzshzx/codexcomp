@@ -131,6 +131,10 @@ curl -sS http://127.0.0.1:8787/healthz            # {"ok":true,...}
 journalctl --user -u codexcomp -f | grep -E 'round|done'   # Linux/WSL
 ```
 
+健康检查响应还会报告当前上游客户端 generation、活跃上游请求数和 WebSocket 数。如果共享上游
+连接池耗尽，codexcomp 会记录脱敏后的连接池快照、只轮换一次客户端，并让 Codex 的下一次重试
+直接使用新连接池，无需重启进程。
+
 命中折叠时的日志——两个连续的 516 被折叠，答案正确：
 
 ```

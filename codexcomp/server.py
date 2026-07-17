@@ -19,10 +19,14 @@ transport-agnostic.
 """
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 import gzip
+from itertools import count
 import json
 import logging
 import os
+import time
 import zlib
 from typing import Any, AsyncIterator
 
@@ -38,6 +42,84 @@ from . import DEFAULT_UPSTREAM
 from .fold import DONE, RoundOpenError, fold
 
 log = logging.getLogger("codexcomp.server")
+
+_REQUEST_IDS = count(1)
+_POOL_MAX_CONNECTIONS = 100
+
+
+def _new_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        trust_env=True,
+        http2=False,
+        limits=httpx.Limits(
+            max_connections=_POOL_MAX_CONNECTIONS,
+            max_keepalive_connections=20,
+            keepalive_expiry=5,
+        ),
+    )
+
+
+def _proxy_summary() -> str:
+    """Describe proxy routing without ever logging credentials."""
+    from urllib.parse import urlsplit
+
+    configured = []
+    for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY",
+                "all_proxy", "https_proxy", "http_proxy"):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        parsed = urlsplit(raw)
+        configured.append(
+            f"{key}={parsed.scheme}://{parsed.hostname}:{parsed.port}")
+    return ",".join(configured) or "direct"
+
+
+def _pool_snapshot(client: httpx.AsyncClient) -> str:
+    """Best-effort httpcore snapshot used only for failure diagnostics."""
+    transports = [getattr(client, "_transport", None)]
+    transports.extend(getattr(client, "_mounts", {}).values())
+    seen: set[int] = set()
+    pools = []
+    for transport in transports:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        pool = getattr(transport, "_pool", None)
+        connections = list(getattr(pool, "connections", ()) or ())
+        if pool is None:
+            continue
+        try:
+            idle = sum(conn.is_idle() for conn in connections)
+            available = sum(conn.is_available() for conn in connections)
+        except (AttributeError, TypeError):
+            pools.append(f"total={len(connections)}")
+            continue
+        active = len(connections) - idle
+        pools.append(
+            f"total={len(connections)} active={active} idle={idle} "
+            f"available={available}")
+    return ";".join(pools) or "unavailable"
+
+
+async def _recover_exhausted_pool(state: Any, failed_client: httpx.AsyncClient,
+                                  context: str) -> None:
+    """Rotate a wedged pool once; later retries use a clean client immediately."""
+    async with state.client_reset_lock:
+        if state.client is not failed_client:
+            return
+        old_snapshot = _pool_snapshot(failed_client)
+        state.client = state.client_factory()
+        state.client_generation += 1
+        log.error(
+            "upstream pool exhausted; rotated client generation=%d context=%s "
+            "active_requests=%d old_pool=[%s] proxy=%s",
+            state.client_generation, context, state.upstream_active,
+            old_snapshot, _proxy_summary(),
+        )
+        # PoolTimeout means an interactive request already waited 30 seconds for
+        # a slot. Abort the wedged generation so its sockets cannot remain stuck.
+        await failed_client.aclose()
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -119,8 +201,9 @@ class UpstreamRounds:
     replayed on every continuation round — mirroring Codex's own per-turn
     OnceLock — unless the downstream request already pinned one."""
 
-    def __init__(self, client: httpx.AsyncClient, responses_url: str,
+    def __init__(self, state: Any, client: httpx.AsyncClient, responses_url: str,
                  headers: dict[str, str]):
+        self.state = state
         self.client = client
         self.responses_url = responses_url
         self.headers = headers
@@ -129,6 +212,8 @@ class UpstreamRounds:
         self._client_pinned_turn_state = any(
             k.lower() == "x-codex-turn-state" for k in headers)
         self._resp: httpx.Response | None = None
+        self._active_request_id: int | None = None
+        self._opened_at: float | None = None
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
         await self.aclose()
@@ -142,14 +227,32 @@ class UpstreamRounds:
             headers=headers,
             timeout=httpx.Timeout(connect=30, read=600, write=60, pool=30),
         )
+        request_id = next(_REQUEST_IDS)
+        self._active_request_id = request_id
+        self._opened_at = time.monotonic()
+        self.state.upstream_active += 1
+        log.debug("upstream request start id=%d kind=round active=%d generation=%d",
+                  request_id, self.state.upstream_active,
+                  self.state.client_generation)
         try:
             resp = await self.client.send(req, stream=True)
         except httpx.HTTPError as exc:
             # No retry: send() may fail after the request reached the upstream
             # (e.g. ReadTimeout), and a re-send would double-generate the turn.
             detail = _http_error_detail(exc)
-            log.warning("round open upstream transport error: %s: %s",
-                        type(exc).__name__, detail)
+            elapsed = time.monotonic() - self._opened_at
+            self.state.upstream_active -= 1
+            self._active_request_id = None
+            self._opened_at = None
+            log.warning(
+                "round open upstream transport error id=%d elapsed=%.3fs "
+                "active=%d generation=%d pool=[%s] proxy=%s: %s: %s",
+                request_id, elapsed, self.state.upstream_active,
+                self.state.client_generation, _pool_snapshot(self.client),
+                _proxy_summary(), type(exc).__name__, detail,
+            )
+            if isinstance(exc, httpx.PoolTimeout):
+                await _recover_exhausted_pool(self.state, self.client, "round")
             raise RoundOpenError(
                 502,
                 f"{type(exc).__name__}: {detail}",
@@ -177,6 +280,13 @@ class UpstreamRounds:
             except Exception:
                 pass
             self._resp = None
+        if self._active_request_id is not None:
+            elapsed = time.monotonic() - (self._opened_at or time.monotonic())
+            self.state.upstream_active -= 1
+            log.debug("upstream request end id=%d kind=round elapsed=%.3fs active=%d",
+                      self._active_request_id, elapsed, self.state.upstream_active)
+            self._active_request_id = None
+            self._opened_at = None
 
 
 # --- downstream websocket session state ----------------------------------------
@@ -275,7 +385,7 @@ def unknown_previous_response_frame(exc: UnknownPreviousResponse) -> dict[str, A
 
 
 def make_rounds(state: Any, headers: dict[str, str]) -> UpstreamRounds:
-    return UpstreamRounds(state.client, state.upstream_base + "/responses", headers)
+    return UpstreamRounds(state, state.client, state.upstream_base + "/responses", headers)
 
 
 async def drive_fold(rounds: UpstreamRounds,
@@ -371,6 +481,10 @@ async def responses_ws(ws: WebSocket) -> None:
     # stays bare — adding flags the upstream doesn't declare would skew Codex's
     # context accounting relative to a direct connection.
     await ws.accept()
+    ws_id = next(_REQUEST_IDS)
+    ws.app.state.websocket_active += 1
+    log.info("ws session open id=%d active=%d", ws_id,
+             ws.app.state.websocket_active)
     headers = upstream_headers(ws.headers.raw)
     sess = WsSession()
     try:
@@ -408,8 +522,13 @@ async def responses_ws(ws: WebSocket) -> None:
                 # a failed send_text must not leave the fold generator (and its
                 # upstream connection) dangling until GC finalization
                 await events.aclose()
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        log.info("ws session disconnected id=%d type=%s", ws_id,
+                 type(exc).__name__)
+    finally:
+        ws.app.state.websocket_active -= 1
+        log.info("ws session close id=%d active=%d", ws_id,
+                 ws.app.state.websocket_active)
 
 
 async def passthrough(request: Request) -> Response:
@@ -422,20 +541,34 @@ async def passthrough(request: Request) -> Response:
     if content:
         content = decompress_body(content, request.headers.get("content-encoding"))
     headers = upstream_headers(request.headers.raw)
+    state = request.app.state
+    client = state.client
+    request_id = next(_REQUEST_IDS)
+    started = time.monotonic()
+    state.upstream_active += 1
     try:
-        upstream = await request.app.state.client.request(
+        upstream = await client.request(
             request.method, url, content=content or None, headers=headers,
             timeout=httpx.Timeout(60),
         )
     except httpx.HTTPError as exc:
         detail = _http_error_detail(exc)
-        log.warning("passthrough upstream error for %s /v1/%s: %s",
-                    request.method, suffix, detail)
+        log.warning(
+            "passthrough upstream error id=%d elapsed=%.3fs active=%d "
+            "generation=%d pool=[%s] proxy=%s for %s /v1/%s: %s: %s",
+            request_id, time.monotonic() - started, state.upstream_active - 1,
+            state.client_generation, _pool_snapshot(client), _proxy_summary(),
+            request.method, suffix, type(exc).__name__, detail,
+        )
+        if isinstance(exc, httpx.PoolTimeout):
+            await _recover_exhausted_pool(state, client, "passthrough")
         return JSONResponse(
             {"error": {"message": f"upstream connection error: {type(exc).__name__}: {detail}",
                        "code": "upstream_connection_error"}},
             status_code=502,
         )
+    finally:
+        state.upstream_active -= 1
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,
@@ -444,20 +577,48 @@ async def passthrough(request: Request) -> Response:
 
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "upstream": request.app.state.upstream_base})
+    state = request.app.state
+    return JSONResponse({
+        "ok": True,
+        "upstream": state.upstream_base,
+        "client_generation": state.client_generation,
+        "active_upstream_requests": state.upstream_active,
+        "active_websockets": state.websocket_active,
+    })
 
 
 def build_app(upstream_base: str | None = None) -> Starlette:
     """Assemble the proxy app. `upstream_base` falls back to the
     CODEXCOMP_UPSTREAM_BASE env var, then the official Codex backend."""
     base = upstream_base or os.environ.get("CODEXCOMP_UPSTREAM_BASE") or DEFAULT_UPSTREAM
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette):
+        log.info(
+            "startup upstream=%s proxy=%s pool_max=%d client_generation=%d",
+            app.state.upstream_base, _proxy_summary(), _POOL_MAX_CONNECTIONS,
+            app.state.client_generation,
+        )
+        try:
+            yield
+        finally:
+            log.info("shutdown active_requests=%d websocket_active=%d pool=[%s]",
+                     app.state.upstream_active, app.state.websocket_active,
+                     _pool_snapshot(app.state.client))
+            await app.state.client.aclose()
+
     app = Starlette(routes=[
         Route("/healthz", health),
         Route("/v1/responses", responses_post, methods=["POST"]),
         WebSocketRoute("/v1/responses", responses_ws),
         Route("/v1/{path:path}", passthrough,
               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]),
-    ])
-    app.state.client = httpx.AsyncClient(trust_env=True, http2=False)
+    ], lifespan=lifespan)
+    app.state.client_factory = _new_http_client
+    app.state.client = app.state.client_factory()
+    app.state.client_reset_lock = asyncio.Lock()
+    app.state.client_generation = 1
+    app.state.upstream_active = 0
+    app.state.websocket_active = 0
     app.state.upstream_base = base.rstrip("/")
     return app

@@ -253,6 +253,33 @@ def test_passthrough_connect_error_returns_502():
     assert "proxy TLS failed" in err["message"]
 
 
+def test_pool_timeout_rotates_client_once():
+    """A saturated/wedged shared pool must self-heal without a process restart."""
+    def exhausted(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no connection available", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(exhausted))
+    app.state.client = failed
+
+    def recovered(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"models": []})
+
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(recovered))
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 2
+        assert app.state.client is not failed
+        assert app.state.upstream_active == 0
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"models": []}
+        assert app.state.client_generation == 2
+
+
 def clear_state():
     upstream_calls.clear()
     upstream_request_headers.clear()
@@ -267,7 +294,8 @@ def main():
                  test_post_header_propagation,
                  test_turn_state_replayed_on_continuation,
                  test_ws_handshake_stays_bare,
-                 test_passthrough_connect_error_returns_502):
+                 test_passthrough_connect_error_returns_502,
+                 test_pool_timeout_rotates_client_once):
         clear_state()
         test()
     print("ws transport self-test: ALL PASS")

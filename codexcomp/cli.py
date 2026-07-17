@@ -83,10 +83,14 @@ def _serve(args) -> int:
         fold.MAX_N = args.max_n
     if args.max_continue is not None:
         fold.MAX_CONTINUE = args.max_continue
-    logging.basicConfig(level=args.log_level.upper(),
-                        format="%(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s pid=%(process)d %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        force=True,
+    )
     uvicorn.run(build_app(args.upstream), host=args.host, port=args.port,
-                log_level=args.log_level)
+                log_level=args.log_level, log_config=None)
     return 0
 
 
