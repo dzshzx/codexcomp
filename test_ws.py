@@ -12,7 +12,7 @@ import json
 import httpx
 from starlette.testclient import TestClient
 
-from codexcomp.server import build_app
+from codexcomp.server import _close_retired_clients_if_idle, build_app
 
 USER1 = {"type": "message", "role": "user",
          "content": [{"type": "input_text", "text": "hi"}]}
@@ -306,6 +306,32 @@ def test_pool_timeout_rotates_client_once():
         assert app.state.client_generation == 2
 
 
+def test_pool_timeout_does_not_close_another_active_stream():
+    """Pool recovery swaps new work over but lets an old live stream drain."""
+    def exhausted(request: httpx.Request) -> httpx.Response:
+        raise httpx.PoolTimeout("no connection available", request=request)
+
+    app = build_app("http://upstream.test/v1")
+    failed = httpx.AsyncClient(transport=httpx.MockTransport(exhausted))
+    app.state.client = failed
+    app.state.client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"models": []})))
+    app.state.upstream_active = 1  # independently tracked live stream
+    client = TestClient(app)
+    with client:
+        resp = client.get("/v1/models")
+        assert resp.status_code == 502, resp.text
+        assert app.state.client_generation == 2
+        assert failed in app.state.retired_clients
+        assert not failed.is_closed
+        assert app.state.upstream_active == 1
+        app.state.upstream_active = 0
+        client.portal.call(_close_retired_clients_if_idle, app.state)
+        assert failed.is_closed
+        assert not app.state.retired_clients
+
+
 def clear_state():
     upstream_calls.clear()
     upstream_request_headers.clear()
@@ -322,7 +348,8 @@ def main():
                  test_ws_handshake_stays_bare,
                  test_passthrough_connect_error_returns_502,
                  test_connect_error_does_not_interrupt_another_active_request,
-                 test_pool_timeout_rotates_client_once):
+                 test_pool_timeout_rotates_client_once,
+                 test_pool_timeout_does_not_close_another_active_stream):
         clear_state()
         test()
     print("ws transport self-test: ALL PASS")

@@ -123,13 +123,27 @@ async def _recover_upstream_client(
         state.client_generation += 1
         log.error(
             "rotated upstream client generation=%d context=%s reason=%s "
-            "active_requests=%d old_pool=[%s] proxy=%s",
+            "active_requests=%d other_active_requests=%d old_pool=[%s] proxy=%s",
             state.client_generation, context, reason,
-            state.upstream_active, old_snapshot, _proxy_summary(),
+            state.upstream_active, other_requests, old_snapshot, _proxy_summary(),
         )
-        # A retired generation is never reused. Closing it also reclaims sockets
-        # left ACTIVE by failed proxy handshakes.
-        await failed_client.aclose()
+        # A retired generation is never reused. Do not close it while another
+        # request may still be streaming from it; the last active request drains
+        # all retired generations below.
+        if other_requests > 0:
+            state.retired_clients.add(failed_client)
+        else:
+            await failed_client.aclose()
+
+
+async def _close_retired_clients_if_idle(state: Any) -> None:
+    if state.upstream_active != 0 or not state.retired_clients:
+        return
+    retired = tuple(state.retired_clients)
+    state.retired_clients.clear()
+    await asyncio.gather(*(client.aclose() for client in retired),
+                         return_exceptions=True)
+    log.info("closed %d drained upstream client generation(s)", len(retired))
 
 # hop-by-hop / transport-specific headers never forwarded upstream
 _DROP_HEADERS = {
@@ -254,6 +268,7 @@ class UpstreamRounds:
             self.state.upstream_active -= 1
             self._active_request_id = None
             self._opened_at = None
+            await _close_retired_clients_if_idle(self.state)
             log.warning(
                 "round open upstream transport error id=%d elapsed=%.3fs "
                 "active=%d generation=%d pool=[%s] proxy=%s: %s: %s",
@@ -305,6 +320,7 @@ class UpstreamRounds:
                       self._active_request_id, elapsed, self.state.upstream_active)
             self._active_request_id = None
             self._opened_at = None
+            await _close_retired_clients_if_idle(self.state)
 
 
 # --- downstream websocket session state ----------------------------------------
@@ -593,6 +609,7 @@ async def passthrough(request: Request) -> Response:
         )
     finally:
         state.upstream_active -= 1
+        await _close_retired_clients_if_idle(state)
     drop = {"content-encoding", "transfer-encoding", "connection", "content-length"}
     return Response(
         upstream.content, status_code=upstream.status_code,
@@ -630,6 +647,9 @@ def build_app(upstream_base: str | None = None) -> Starlette:
                      app.state.upstream_active, app.state.websocket_active,
                      _pool_snapshot(app.state.client))
             await app.state.client.aclose()
+            await asyncio.gather(
+                *(client.aclose() for client in app.state.retired_clients),
+                return_exceptions=True)
 
     app = Starlette(routes=[
         Route("/healthz", health),
@@ -641,6 +661,7 @@ def build_app(upstream_base: str | None = None) -> Starlette:
     app.state.client_factory = _new_http_client
     app.state.client = app.state.client_factory()
     app.state.client_reset_lock = asyncio.Lock()
+    app.state.retired_clients = set()
     app.state.client_generation = 1
     app.state.upstream_active = 0
     app.state.websocket_active = 0
