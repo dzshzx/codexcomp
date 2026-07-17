@@ -238,9 +238,13 @@ class UpstreamRounds:
         self._resp: httpx.Response | None = None
         self._active_request_id: int | None = None
         self._opened_at: float | None = None
+        # Pin the client for the entire fold, not just one HTTP round. A fold
+        # may close round N and immediately open N+1 on the same client.
+        self._owner_active = True
+        self.state.upstream_active += 1
 
     async def open(self, body: dict[str, Any]) -> AsyncIterator[dict | object]:
-        await self.aclose()
+        await self._close_response()
         headers = {**self.headers, "content-type": "application/json",
                    "accept": "text/event-stream"}
         if self._turn_state is not None and not self._client_pinned_turn_state:
@@ -254,7 +258,6 @@ class UpstreamRounds:
         request_id = next(_REQUEST_IDS)
         self._active_request_id = request_id
         self._opened_at = time.monotonic()
-        self.state.upstream_active += 1
         log.debug("upstream request start id=%d kind=round active=%d generation=%d",
                   request_id, self.state.upstream_active,
                   self.state.client_generation)
@@ -265,27 +268,27 @@ class UpstreamRounds:
             # (e.g. ReadTimeout), and a re-send would double-generate the turn.
             detail = _http_error_detail(exc)
             elapsed = time.monotonic() - self._opened_at
-            self.state.upstream_active -= 1
             self._active_request_id = None
             self._opened_at = None
-            await _close_retired_clients_if_idle(self.state)
             log.warning(
                 "round open upstream transport error id=%d elapsed=%.3fs "
                 "active=%d generation=%d pool=[%s] proxy=%s: %s: %s",
-                request_id, elapsed, self.state.upstream_active,
+                request_id, elapsed, self.state.upstream_active - 1,
                 self.state.client_generation, _pool_snapshot(self.client),
                 _proxy_summary(), type(exc).__name__, detail,
             )
             if isinstance(exc, httpx.PoolTimeout):
                 await _recover_upstream_client(
-                    self.state, self.client, "round", "pool-timeout")
+                    self.state, self.client, "round", "pool-timeout",
+                    current_request_counted=True)
             elif isinstance(exc, httpx.ConnectError):
                 # A failed SOCKS/HTTP proxy handshake can remain ACTIVE in
                 # httpcore even though no application request owns it. Rotate
                 # only when doing so cannot interrupt another upstream stream.
                 await _recover_upstream_client(
                     self.state, self.client, "round", "connect-error",
-                    require_no_other_requests=True)
+                    require_no_other_requests=True,
+                    current_request_counted=True)
             raise RoundOpenError(
                 502,
                 f"{type(exc).__name__}: {detail}",
@@ -306,7 +309,7 @@ class UpstreamRounds:
         self._resp = resp
         return parse_sse(resp.aiter_text())
 
-    async def aclose(self) -> None:
+    async def _close_response(self) -> None:
         if self._resp is not None:
             try:
                 await self._resp.aclose()
@@ -315,11 +318,17 @@ class UpstreamRounds:
             self._resp = None
         if self._active_request_id is not None:
             elapsed = time.monotonic() - (self._opened_at or time.monotonic())
-            self.state.upstream_active -= 1
             log.debug("upstream request end id=%d kind=round elapsed=%.3fs active=%d",
-                      self._active_request_id, elapsed, self.state.upstream_active)
+                      self._active_request_id, elapsed,
+                      self.state.upstream_active - 1)
             self._active_request_id = None
             self._opened_at = None
+
+    async def aclose(self) -> None:
+        await self._close_response()
+        if self._owner_active:
+            self._owner_active = False
+            self.state.upstream_active -= 1
             await _close_retired_clients_if_idle(self.state)
 
 

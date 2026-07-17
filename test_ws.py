@@ -225,6 +225,48 @@ def test_turn_state_replayed_on_continuation():
     assert resp.headers["x-codex-turn-state"] == "TS_1"
 
 
+def test_fold_keeps_client_owned_across_continuation():
+    """Closing round one must not make a retired pinned client drain mid-fold."""
+    app = build_app("http://upstream.test/v1")
+    calls = 0
+    pinned: httpx.AsyncClient
+
+    def retire_after_first_round(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert app.state.upstream_active == 1
+        if calls == 1:
+            app.state.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(mock_upstream))
+            app.state.client_generation += 1
+            app.state.retired_clients.add(pinned)
+            return httpx.Response(
+                200, content=truncated_sse("resp_retired_1"),
+                headers={"content-type": "text/event-stream"},
+            )
+        assert not pinned.is_closed, "pinned client closed before continuation"
+        return httpx.Response(
+            200, content=canned_sse("resp_retired_2"),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    pinned = httpx.AsyncClient(
+        transport=httpx.MockTransport(retire_after_first_round))
+    app.state.client = pinned
+    client = TestClient(app)
+    with client:
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "truncate-once", "stream": True, "input": [USER1]},
+        )
+        assert resp.status_code == 200
+        assert "response.completed" in resp.text
+        assert calls == 2
+        assert pinned.is_closed
+        assert not app.state.retired_clients
+        assert app.state.upstream_active == 0
+
+
 def test_ws_handshake_stays_bare():
     """Codex reads server_reasoning_included ONLY from the 101 upgrade response
     (presence-based). The real backend's handshake does not carry it
@@ -345,6 +387,7 @@ def main():
                  test_post_sse_unchanged,
                  test_post_header_propagation,
                  test_turn_state_replayed_on_continuation,
+                 test_fold_keeps_client_owned_across_continuation,
                  test_ws_handshake_stays_bare,
                  test_passthrough_connect_error_returns_502,
                  test_connect_error_does_not_interrupt_another_active_request,
