@@ -61,6 +61,10 @@ downstream response — Codex sees one complete, untruncated answer.
   round's output is released downstream.
 - **Honest accounting** — the true cumulative cost of folded rounds is reported under
   `metadata.proxy_billed_usage`.
+- **Self-healing upstream pool** — an exhausted or wedged connection pool (`PoolTimeout`,
+  dead proxy handshakes) rotates the shared upstream client to a fresh generation instead
+  of failing every request until a restart; per-client leases guarantee in-flight streams
+  and folds are never interrupted, and `/healthz` reports the generation and active counts.
 - **Loopback-only, auth passthrough** — forwards Codex's `Authorization` header; never
   reads, persists, or logs a credential.
 - **Opt-in autostart** — installation registers nothing; one command sets up a systemd user
@@ -144,7 +148,9 @@ The health response also reports the current upstream-client generation and acti
 WebSocket counts. If the shared upstream pool becomes exhausted, codexcomp logs a sanitized pool
 snapshot, rotates the client once, and lets Codex's next retry use a fresh pool without restarting
 the process. A failed proxy handshake is handled the same way when no other upstream stream is
-active, preventing dead handshakes from accumulating into later pool starvation.
+active, preventing dead handshakes from accumulating into later pool starvation. An upstream
+read that stalls for 120 s times out through the normal terminal contract instead of pinning
+a pool connection for minutes.
 
 A live fold — two consecutive 516s folded, answer correct:
 
